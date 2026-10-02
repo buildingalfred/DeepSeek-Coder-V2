@@ -34,7 +34,7 @@ import re
 import numpy as np
 import pandas as pd
 
-from . import indicators
+from . import features, indicators
 
 PRICE_COLUMNS = ["open", "high", "low", "close", "volume"]
 OPS = [">", "<", ">=", "<=", "==", "crosses_above", "crosses_below"]
@@ -47,7 +47,7 @@ class SpecError(ValueError):
     """A strategy spec is malformed. The message is written to be shown back to an agent."""
 
 
-def build_columns(df: pd.DataFrame, spec: dict) -> pd.DataFrame:
+def build_columns(df: pd.DataFrame, spec: dict, cache=None) -> pd.DataFrame:
     """Validate the spec and return a frame with every column the rules can reference."""
     if not isinstance(spec, dict):
         raise SpecError("spec must be a JSON object")
@@ -62,11 +62,22 @@ def build_columns(df: pd.DataFrame, spec: dict) -> pd.DataFrame:
             raise SpecError(f"duplicate or reserved indicator id '{ind_id}'")
         params = {k: v for k, v in ind.items() if k not in ("id", "type")}
         try:
-            out = indicators.compute(df, kind, params)
+            out = cache.get(df, kind, params) if cache else indicators.compute(df, kind, params)
         except (ValueError, TypeError, KeyError) as e:
             raise SpecError(f"indicator '{ind_id}': {e}") from e
         for name in out.columns:
             cols[ind_id if name == "value" else f"{ind_id}.{name}"] = out[name]
+
+    for feat in spec.get("features") or []:
+        if not isinstance(feat, dict):
+            raise SpecError(f"feature entries must be objects, got {feat!r}")
+        fid = feat.get("id")
+        if not fid or not _ID_RE.match(str(fid)) or fid in cols.columns:
+            raise SpecError(f"feature needs a new 'id' made of letters, digits or _ (got {fid!r})")
+        try:
+            cols[fid] = features.evaluate(feat.get("expr", ""), cols, df.attrs.get("tz", "UTC"))
+        except features.FeatureError as e:
+            raise SpecError(f"feature '{fid}': {e}") from e
 
     if not any(spec.get(k) for k in ("entry_long", "entry_short")):
         raise SpecError("spec needs at least one condition in entry_long or entry_short")
@@ -127,9 +138,9 @@ def _condition_mask(cond: dict, cols: pd.DataFrame) -> np.ndarray:
     return m.to_numpy(dtype=bool)
 
 
-def signals(df: pd.DataFrame, spec: dict) -> dict:
+def signals(df: pd.DataFrame, spec: dict, cache=None) -> dict:
     """Boolean arrays for each rule list (AND of its conditions; empty list -> never true)."""
-    cols = build_columns(df, spec)
+    cols = build_columns(df, spec, cache)
     out = {}
     for key in RULE_KEYS:
         rules = spec.get(key) or []
@@ -177,7 +188,7 @@ def describe(spec: dict) -> str:
             f"{c['left']} {c['op']} {c['right']}" + (f" within {c['within']}" if c.get("within") else "")
             for c in spec.get(key) or [])
 
-    parts = []
+    parts = [f"{f.get('id')} = {f.get('expr')}" for f in spec.get("features") or []]
     for key in RULE_KEYS:
         r = rules(key)
         if r:

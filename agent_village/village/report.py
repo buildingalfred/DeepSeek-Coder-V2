@@ -39,7 +39,7 @@ HEADERS = ["#", "Strategy", "By", "Robust score", "Good periods", "Train Sharpe"
 NUMERIC = range(3, 13)
 
 
-def markdown(dataset, rows, best, story, trials, brain, fee_bps, analysis="") -> str:
+def markdown(dataset, rows, best, story, trials, brain, fee_bps, analysis="", whiteboard="") -> str:
     lines = [f"# Village report: {dataset}", "",
              f"{time.strftime('%Y-%m-%d %H:%M')} · brain: {brain} · fees {fee_bps} bps/side", "",
              _intro(trials), "",
@@ -55,6 +55,8 @@ def markdown(dataset, rows, best, story, trials, brain, fee_bps, analysis="") ->
                   "Each condition of the leader was removed in turn to see how much the score "
                   "drops. Essential pieces are the real signal; pieces that add nothing are noise.",
                   "", analysis.split(" ", 1)[1] if analysis.startswith("#") else analysis]
+    if whiteboard:
+        lines += ["", "## The whiteboard (latest notes)", "", whiteboard]
     if best:
         lines += ["", f"## Best candidate: {best['name']} ({best['verdict']})", "",
                   strat.describe(best["spec"]), ""]
@@ -231,7 +233,7 @@ def _ticks(lo: float, hi: float) -> list[float]:
 
 
 def html(dataset, rows, best, story, trials, brain, fee_bps, charts, train_frac,
-         analysis="") -> str:
+         analysis="", whiteboard="") -> str:
     intro = _intro(trials).replace("**", "")
     head = "".join(f'<th class="{"num" if i in NUMERIC else ""}">{_e(h)}</th>'
                    for i, h in enumerate(HEADERS))
@@ -262,6 +264,10 @@ def html(dataset, rows, best, story, trials, brain, fee_bps, charts, train_frac,
                    "condition of the leading strategy in turn. If the score collapses, that piece "
                    "is the real signal. If nothing changes, it is decoration.</p>"
                    f"<div class='card story'>{_e(text)}</div>")
+    if whiteboard:
+        out.append("<h2>The whiteboard</h2><p class='meta'>Hunches, findings and dead ends the "
+                   "team wrote down while working (latest last).</p>"
+                   f"<div class='card story'>{_e(whiteboard)}</div>")
     if charts:
         out.append("<h2>Equity curves</h2><p class='meta'>Growth of 1 unit of money (log scale). "
                    "Hover for values. The shaded part is the vault: what happened on data the "

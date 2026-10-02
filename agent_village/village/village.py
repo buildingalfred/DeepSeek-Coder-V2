@@ -5,19 +5,32 @@ import random
 import time
 from pathlib import Path
 
-from . import backtest, data, report
+from . import backtest, data, indicators, pine, report
 from . import strategy as strat
-from .agents import (Analyst, Critic, Librarian, Mayor, Quant, Tuner, base_name, compact,
-                     leaderboard_text)
+from .agents import (Analyst, Critic, Inventor, Librarian, Mayor, Quant, Tuner, base_name,
+                     compact, leaderboard_text)
 from .board import Board
 
 MAX_ATTEMPTS_LLM = 3        # an LLM quant gets this many tries to produce a valid, new strategy
 MAX_ATTEMPTS_HEURISTIC = 8  # random villagers are cheap, let them retry more on duplicates
 
 
+def behaviour(evaluation: dict) -> str:
+    """Two strategies with the same trades and returns are the same strategy, whatever the rules."""
+    t, v = evaluation["train"], evaluation["test"]
+    return json.dumps([t.get("trades"), t.get("total_return_pct"), t.get("sharpe"),
+                       v.get("trades"), v.get("total_return_pct")])
+
+
+def short_id(spec: dict) -> str:
+    import hashlib
+    return hashlib.sha1(fingerprint(spec).encode()).hexdigest()[:4]
+
+
 def fingerprint(spec: dict) -> str:
     """Identity of a strategy's rules, ignoring its name and description."""
-    core = {k: v for k, v in spec.items() if k not in ("name", "idea") and not k.startswith("_")}
+    core = {k: v for k, v in spec.items()
+            if k not in ("name", "idea", "whiteboard") and not k.startswith("_")}
     for key in strat.RULE_KEYS:
         core.setdefault(key, [])
     core.setdefault("stop_loss_pct", None)
@@ -40,6 +53,8 @@ class Village:
         intraday = any(data.bar_size(df) not in ("1d", "1w", "unknown") for df in self.markets.values())
         self.librarian = Librarian("Lena the Librarian", llm, log, mission)
         self.analyst = Analyst("Ada the Analyst", None, log)
+        self.inventor = Inventor("Nova the Inventor", llm, log, random.Random(rng.random()),
+                                 intraday, mission)
         self.critic = Critic("Carl the Critic", llm, log)
         self.mayor = Mayor("Maya the Mayor", llm, log)
         self.tuner = Tuner("Tess the Tuner", None, log, random.Random(rng.random())) if tuner else None
@@ -58,10 +73,13 @@ class Village:
         self.data_summary = "\n".join(
             data.summary(df.iloc[: int(len(df) * train_frac)], f"{name} (train period only)")
             for name, df in self.markets.items())
-        self.seen = {fingerprint(r["spec"]) for r in board.all_strategies(dataset) if r["spec"]}
+        self.caches = {name: indicators.Cache() for name in self.markets}
+        rows = board.all_strategies(dataset)
+        self.seen = {fingerprint(r["spec"]) for r in rows if r["spec"]}
+        self.behaviours = {behaviour(r) for r in rows if r["train"] and r["test"]}
 
     def evaluate(self, spec: dict) -> dict:
-        return backtest.evaluate(self.markets, spec, self.fee_bps, self.train_frac)
+        return backtest.evaluate(self.markets, spec, self.fee_bps, self.train_frac, self.caches)
 
     def score(self, evaluation: dict) -> float:
         return backtest.score(evaluation, len(self.markets))
@@ -80,6 +98,7 @@ class Village:
                 self._turn(quant, r)
             if self.tuner:
                 self._tune(r)
+            self._invent(r)
             analysis = self._analyse(r)
             critique = self.critic.review(self.board.in_round(self.dataset, r),
                                           leaderboard_text(self.board.leaderboard(self.dataset, 5))
@@ -97,6 +116,7 @@ class Village:
         critiques = self.board.notes("critique", 1, self.dataset)
         analyses = self.board.notes("analysis", 1, self.dataset)
         return {
+            "whiteboard": self.whiteboard_text(14),
             "data_summary": self.data_summary,
             "ideas": "\n".join(f"- {n['content']}" for n in self.board.notes("idea", 15)),
             "leaderboard": leaderboard_text(top),
@@ -118,7 +138,10 @@ class Village:
                 break
             if attempt + 1 < attempts and quant.llm is not None:
                 self.log(f"  [{quant.name}] rejected ({error[:100]}), retrying")
-        clean = {k: v for k, v in spec.items() if not k.startswith("_")}
+        note = spec.get("whiteboard")
+        if isinstance(note, str) and note.strip():
+            self.write(round_, quant.name, note.strip()[:300])
+        clean = {k: v for k, v in spec.items() if not k.startswith("_") and k != "whiteboard"}
         if error:
             self.board.add_strategy(round_, quant.name, clean, None, None, None, error, self.dataset)
             self.log(f"  [{quant.name}] gave up this round: {error[:160]}")
@@ -132,15 +155,37 @@ class Village:
             return None, ("these exact rules were already tested; change the indicators, "
                           "parameters or conditions to try something new")
         try:
-            return self.evaluate(spec), None
+            evaluation = self.evaluate(spec)
         except strat.SpecError as e:
             return None, str(e)
+        if not evaluation["train"].get("trades"):
+            return None, ("this strategy never trades on the train data; its conditions are "
+                          "never all true together. Loosen them or use 'within' to chain steps")
+        if behaviour(evaluation) in self.behaviours:
+            return None, ("this trades exactly like a strategy already tested (same trades and "
+                          "returns), so the extra rules change nothing; try a real difference")
+        return evaluation, None
+
+    def write(self, round_: int, author: str, text: str) -> None:
+        """Put a note on the shared whiteboard."""
+        self.board.post(round_, author, "whiteboard", text, self.dataset)
+
+    def whiteboard_text(self, n: int = 14) -> str:
+        notes = self.board.notes("whiteboard", n, self.dataset)
+        return "\n".join(f"- [r{x['round']} {x['author'].split(' ')[0]}] {x['content']}" for x in notes)
 
     def _record(self, round_: int, author: str, spec: dict, evaluation: dict) -> int:
         score = self.score(evaluation)
+        top = self.board.leaderboard(self.dataset, 1)
+        if score > -99 and (not top or score > top[0]["score"] + 0.05):
+            t = evaluation["train"]
+            self.write(round_, author, f"AHA: new leader '{spec.get('name', 'unnamed')}' "
+                                       f"(robust {t['robust_sharpe']}, t {t['t_stat']}, "
+                                       f"{t['trades']} trades). Rules: {strat.describe(spec)}")
         sid = self.board.add_strategy(round_, author, spec, evaluation["train"], evaluation["test"],
                                       score, None, self.dataset, evaluation["markets"])
         self.seen.add(fingerprint(spec))
+        self.behaviours.add(behaviour(evaluation))
         t = evaluation["train"]
         self.log(f"  [{author}] #{sid} '{spec.get('name', 'unnamed')}': robust {t['robust_sharpe']}, "
                  f"sharpe {t['sharpe']}, return {t['total_return_pct']}%, trades {t['trades']}, "
@@ -178,12 +223,54 @@ class Village:
         self.board.post(round_, self.analyst.name, "analysis", text, self.dataset)
         self.board.post(round_, self.analyst.name, "trials", str(len(rows)), self.dataset)
         self.log(f"  [{self.analyst.name}]\n" + _indent(text))
+        essential = [r for r in rows if r["impact"] > 0.2][:2]
+        for row in rows:
+            if row in essential:
+                self.write(round_, self.analyst.name,
+                           f"AHA: '{row['condition']}' is ESSENTIAL in the leader (without it "
+                           f"{row['without']} vs {leader['score']}). Keep it, build around it.")
+            elif row["impact"] < -0.05:
+                self.write(round_, self.analyst.name,
+                           f"Dead end: '{row['condition']}' HURTS the leader; drop it.")
         # If dropping a piece clearly helps, submit the simpler version for the team to build on.
         worst = rows[-1] if rows else None
-        if worst and worst["impact"] < -0.05 and fingerprint(worst["variant"]) not in self.seen:
+        if worst and worst["impact"] < -0.05:
             spec = dict(worst["variant"], name=f"{base_name(leader['name'])} (simplified)")
-            self._record(round_, self.analyst.name, spec, self.evaluate(spec))
+            evaluation, error = self._try(spec)
+            if not error:
+                self._record(round_, self.analyst.name, spec, evaluation)
         return text
+
+    def _invent(self, round_: int) -> None:
+        """Nova writes hypotheses on the whiteboard and grafts one invented filter on a leader."""
+        top = [r for r in self.board.leaderboard(self.dataset, 3) if r["score"] > -99]
+        for h in self.inventor.brainstorm(self._context(self.quants[0])):
+            self.write(round_, self.inventor.name, f"Hypothesis: {h}")
+        if not top:
+            return
+        tried = 0
+        for _ in range(6):
+            spec, idea = self.inventor.graft(self.inventor.rng.choice(top)["spec"])
+            evaluation, error = self._try(spec)
+            if error:
+                continue
+            tried += 1
+            sid = self._record(round_, self.inventor.name, spec, evaluation)
+            t = evaluation["train"]
+            self.write(round_, self.inventor.name,
+                       f"{idea} Tested as #{sid}: robust {t['robust_sharpe']}, {t['trades']} trades.")
+            return
+
+    def seed(self, specs: list[dict], author: str) -> int:
+        """Bring strategies found elsewhere (e.g. a smaller window) onto this board."""
+        round_ = self.board.last_round()
+        added = 0
+        for spec in specs:
+            evaluation, error = self._try(spec)
+            if not error:
+                self._record(round_, author, spec, evaluation)
+                added += 1
+        return added
 
     def _ablation_score(self, spec: dict):
         try:
@@ -192,11 +279,8 @@ class Village:
             return None
 
     def _tuner_eval(self, spec: dict):
-        if fingerprint(spec) in self.seen:
-            return None
-        try:
-            evaluation = self.evaluate(spec)
-        except strat.SpecError:
+        evaluation, error = self._try(spec)
+        if error:
             return None
         return evaluation, self.score(evaluation)
 
@@ -222,16 +306,27 @@ class Village:
         out = Path(report_dir)
         out.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        md = report.markdown(self.dataset, rows, best, story, trials, brain, self.fee_bps, analysis)
+        board_text = self.whiteboard_text(20)
+        ladders = self.board.notes("ladder", 1, self.dataset)
+        if ladders:
+            analysis = (analysis + "\n\n" if analysis else "") + \
+                "Scout-and-expand ladder (robust / unseen sharpe per window):\n" + ladders[-1]["content"]
+        md = report.markdown(self.dataset, rows, best, story, trials, brain, self.fee_bps, analysis,
+                             board_text)
         path = out / f"report-{stamp}.md"
         path.write_text(md, encoding="utf-8")
         charts = [(r, self._curves(r["spec"])) for r in (rows[:3] if rows else [])]
         html_path = out / f"report-{stamp}.html"
         html_path.write_text(report.html(self.dataset, rows, best, story, trials, brain,
-                                         self.fee_bps, charts, self.train_frac, analysis),
+                                         self.fee_bps, charts, self.train_frac, analysis,
+                                         board_text),
                              encoding="utf-8")
         if best:
             (out / "best_strategy.json").write_text(json.dumps(best["spec"], indent=2), "utf-8")
+            code = pine.to_pine(best["spec"], self.fee_bps, {"train": best["train"],
+                                                            "vault": best["test"]})
+            (out / "best_strategy.pine").write_text(code, "utf-8")
+            self.log(f"Pine Script for TradingView: {out / 'best_strategy.pine'}")
         self.log(f"\nReport written to {html_path} (open it in a browser) and {path}")
         return path
 

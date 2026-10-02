@@ -8,27 +8,92 @@ import pandas as pd
 from .strategy import PRICE_COLUMNS
 
 _ALIASES = {
-    "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume",
-    "adj close": "adj_close", "adj_close": "adj_close", "vol": "volume",
+    "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "last": "close",
+    "adj close": "adj_close", "adj_close": "adj_close", "vol": "volume", "<open>": "open",
+    "<high>": "high", "<low>": "low", "<close>": "close", "<vol>": "volume", "<date>": "date",
+    "<time>": "time", "<dtyyyymmdd>": "date", "gmt time": "datetime", "local time": "datetime",
+    "date time": "datetime", "date_time": "datetime", "totalvolume": "volume", "up": "upvol",
 }
-_TIME_NAMES = ("date", "datetime", "time", "timestamp", "open_time", "index")
+_TIME_NAMES = ("datetime", "timestamp", "open_time", "date", "time", "index")
+_FORMATS = ["%Y%m%d %H%M%S", "%Y%m%d %H:%M:%S", "%Y%m%d %H%M", "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
+            "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y.%m.%d %H:%M", "%Y.%m.%d %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d", "%m/%d/%Y", "%Y%m%d", "%d.%m.%Y"]
+DATA_SUFFIXES = (".csv", ".txt")
 
 
-def load_csv(path: str | Path, tz: str = "UTC") -> pd.DataFrame:
-    """Read a CSV with a date/time column and open, high, low, close (volume optional).
+def _sniff(path: Path) -> tuple[str, bool]:
+    """Guess the separator and whether the first line is a header."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        first = f.readline()
+    sep = max([",", ";", "\t", "|"], key=first.count)
+    if first.count(sep) == 0:
+        sep = r"\s+"
+    cells = [c.strip().strip('"') for c in (first.split() if sep == r"\s+" else first.split(sep))]
+    header = any(any(ch.isalpha() for ch in c) and not _looks_like_date(c) for c in cells)
+    return sep, header
 
-    tz is the timezone the CSV's times are written in (used by the ICT session indicators).
-    Times that carry their own offset are converted to UTC instead."""
-    df = pd.read_csv(path)
-    df.columns = [_ALIASES.get(c.strip().lower(), c.strip().lower()) for c in df.columns]
+
+def _looks_like_date(text: str) -> bool:
+    return pd.notna(pd.to_datetime(text, errors="coerce", format="mixed"))
+
+
+def _parse_times(raw: pd.Series) -> pd.Series:
+    """Parse date/time text quickly by finding one format that fits, then using it everywhere."""
+    text = raw.astype(str).str.strip()
+    sample = text.iloc[: min(len(text), 500)]
+    for fmt in _FORMATS:
+        try:
+            pd.to_datetime(sample, format=fmt)
+        except (ValueError, TypeError):
+            continue
+        return pd.to_datetime(text, format=fmt)
+    return pd.to_datetime(text, format="mixed")
+
+
+def _clock(raw: pd.Series) -> pd.Series:
+    """Normalise a separate time column: 930 / 0930 / 093000 -> 09:30[:00]."""
+    t = raw.astype(str).str.strip()
+    if t.str.fullmatch(r"\d{1,6}").all():
+        t = t.str.zfill(4 if t.str.len().max() <= 4 else 6)
+        t = t.str[:2] + ":" + t.str[2:4] + np.where(t.str.len() == 6, ":" + t.str[4:6], "")
+    return t
+
+
+def load_csv(path: str | Path, tz: str = "UTC", timeframe: str | None = None) -> pd.DataFrame:
+    """Read OHLCV bars from a CSV/TXT export (TradingView, Yahoo, NinjaTrader, Kibot, FirstRate,
+    TradeStation, MetaTrader ...). Handles separate date and time columns, files without a
+    header, and , ; tab or space separators.
+
+    tz is the time zone the file's times are written in (used by the ICT session indicators).
+    Times that carry their own offset are converted to UTC instead. timeframe (e.g. "5min",
+    "15min", "1h", "4h", "1D") aggregates the bars after loading."""
+    path = Path(path)
+    sep, header = _sniff(path)
+    df = pd.read_csv(path, sep=sep, header=0 if header else None, engine="python" if sep == r"\s+"
+                     else "c", skipinitialspace=True)
+    if header:
+        df.columns = [_ALIASES.get(str(c).strip().lower(), str(c).strip().lower()) for c in df.columns]
+    else:
+        # No header: date[, time], open, high, low, close[, volume]
+        first = df.iloc[0].astype(str).tolist()
+        has_clock = len(first) >= 6 and (":" in first[1] or (first[1].isdigit() and len(first[1]) <= 6
+                                                            and len(first[0]) >= 8))
+        names = (["date", "time"] if has_clock else ["datetime"]) + ["open", "high", "low", "close",
+                                                                    "volume"]
+        df = df.iloc[:, : len(names)]
+        df.columns = names[: df.shape[1]]
+    if "date" in df.columns and "time" in df.columns:
+        df["datetime"] = df["date"].astype(str).str.strip() + " " + _clock(df["time"])
+        df = df.drop(columns=["date", "time"])
     time_col = next((c for c in _TIME_NAMES if c in df.columns), None)
     if time_col:
         ts = df[time_col]
-        if pd.api.types.is_numeric_dtype(ts):
+        if pd.api.types.is_numeric_dtype(ts) and ts.iloc[0] > 1e8:
             unit = "ms" if ts.iloc[0] > 1e11 else "s"
             df.index = pd.to_datetime(ts, unit=unit)
         else:
-            parsed = pd.to_datetime(ts, utc=False, format="mixed")
+            parsed = _parse_times(ts)
             if getattr(parsed.dt, "tz", None) is not None:
                 df.index = parsed.dt.tz_convert("UTC").dt.tz_localize(None)
                 tz = "UTC"
@@ -44,10 +109,31 @@ def load_csv(path: str | Path, tz: str = "UTC") -> pd.DataFrame:
         df["volume"] = 0.0
     df = df[PRICE_COLUMNS].apply(pd.to_numeric, errors="coerce").dropna(subset=["close"])
     df = df[~df.index.duplicated()].sort_index()
+    if (df[["open", "high", "low", "close"]] <= 0).any().any():
+        raise ValueError(f"{path}: has zero or negative prices. Back-adjusted futures can go "
+                         "negative far back in history; use ratio-adjusted or unadjusted data.")
+    df.attrs["tz"] = tz
+    if timeframe:
+        df = resample(df, timeframe)
     if len(df) < 200:
         raise ValueError(f"{path}: only {len(df)} rows; need at least 200 bars to backtest")
-    df.attrs["tz"] = tz
     return df
+
+
+def resample(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Aggregate bars to a bigger timeframe. Bars are labelled by their open time."""
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("resampling needs a date/time column")
+    try:
+        rule = pd.tseries.frequencies.to_offset(timeframe.replace("m", "min")
+                                                if timeframe.endswith("m") else timeframe)
+    except ValueError as e:
+        raise ValueError(f"unknown timeframe '{timeframe}', try 5min, 15min, 1h, 4h or 1D") from e
+    out = df.resample(rule, label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+    out = out.dropna(subset=["close"])
+    out.attrs["tz"] = df.attrs.get("tz", "UTC")
+    return out
 
 
 def fetch(symbol: str, period: str = "max", interval: str = "1d") -> pd.DataFrame:

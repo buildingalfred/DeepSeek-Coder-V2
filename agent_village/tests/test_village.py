@@ -113,9 +113,9 @@ class FakeLLM:
         if self.calls == 2:
             return "not json at all"
         # Call 4 repeats call 3's rules, which the village must reject as a duplicate.
-        period = 2 + (self.calls if self.calls != 4 else 3)
-        return json.dumps({"name": "rsi2", "indicators": [{"id": "r", "type": "rsi", "period": period}],
-                           "entry_long": [{"left": "r", "op": "<", "right": 10}],
+        level = 10 + 3 * (self.calls if self.calls != 4 else 3)
+        return json.dumps({"name": "rsi2", "indicators": [{"id": "r", "type": "rsi", "period": 2}],
+                           "entry_long": [{"left": "r", "op": "<", "right": level}],
                            "exit_long": [{"left": "r", "op": ">", "right": 70}]})
 
 
@@ -131,9 +131,12 @@ def test_village_end_to_end_with_fake_llm(tmp_path, df):
     assert list((tmp_path / "reports").glob("*.html"))
     assert board.notes("idea")
     assert any("already tested" in p for p in llm.prompts)
-    rows = board.all_strategies("sample")
+    rows = [r for r in board.all_strategies("sample") if "quant" in r["author"]]
     assert len(rows) == 6
-    assert len({json.dumps(r["spec"]["indicators"]) for r in rows}) == 6
+    assert len({json.dumps(r["spec"]["entry_long"]) for r in rows}) == 6
+    # Nova grafts invented features onto leaders and writes on the whiteboard.
+    assert any(r["author"].startswith("Nova") for r in board.all_strategies("sample"))
+    assert board.notes("whiteboard", 50, "sample")
     # A second run continues the round numbering instead of starting over.
     v.run(rounds=1, report_dir=str(tmp_path / "reports"))
     assert board.last_round() == 3
@@ -329,3 +332,202 @@ def test_short_noisy_vault_is_flagged_as_possible_luck():
     assert verdict(train, {"sharpe": 0.9, "trades": 30, "t_stat": 3.0}) == "held up"
     assert verdict(train, {"sharpe": 0.9, "trades": 30, "t_stat": 1.1}) == "held up, but could be luck"
     assert backtest.luck_bar(1000) > backtest.luck_bar(10)
+
+
+# ---- Pine Script export --------------------------------------------------------------------
+
+from village import pine  # noqa: E402
+
+
+def _all_indicator_spec():
+    inds = [{"id": f"x{i}", "type": k} for i, k in enumerate([*indicators.CATALOG, *ict.CATALOG])]
+    return {"name": 'all "kinds"', "indicators": inds,
+            "entry_long": [{"left": "close", "op": "crosses_above", "right": "x0", "within": 3}],
+            "exit_long": [{"left": "x2", "op": ">", "right": 70}],
+            "entry_short": [{"left": "x12.bear", "op": "==", "right": 1}], "exit_short": [],
+            "stop_loss_pct": 2, "take_profit_pct": 4}
+
+
+def test_pine_covers_every_indicator_and_rule():
+    src = pine.to_pine(_all_indicator_spec(), 5)
+    assert src.startswith("//@version=5") and "strategy(" in src
+    assert 'all \'kinds\'' in src            # quotes in names cannot break the script
+    assert "f_within(f_xup(close, i_x0), 3)" in src
+    assert "commission_value=0.05" in src and "stopPct = 0.02" in src
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("VILLAGE_SLOW"),
+                    reason="slow (about a minute); run with VILLAGE_SLOW=1")
+def test_pine_is_valid_syntax():
+    parser = pytest.importorskip("pynescript.ast")
+    rng = random.Random(0)
+    # The parser is slow, so check the spec that uses everything plus two random sequences.
+    specs = [agents.random_spec(s, rng, intraday=True) for s in ("ict_liquidity", "ict_time")]
+    nova = agents.Inventor("n", rng=random.Random(5), intraday=True)
+    every_function = {"name": "fx", "indicators": [{"id": "sw", "type": "sweep"}], "features": [
+        {"id": f"f{i}", "expr": e} for i, e in enumerate([
+            "bars_since(sw.bull)", "minutes_since(sw.bear)", "count(sw.bull, 9)", "day_count(sw.bull)",
+            "sum(close, 3) + mean(close, 3) - highest(high, 5) * lowest(low, 5) / std(close, 5)",
+            "prev(close, 2) % 7 + change(close)", "digital_root(f2) + abs(-1) + round(1.5) + floor(2.2)",
+            "min(open, close) - max(open, close)", "where(not sw.bull, 1, -1)",
+            "ny_minute() >= 570 and day_of_week() <= 4 or close != open"])],
+        "entry_long": [{"left": "f9", "op": "==", "right": 1}], "exit_long": []}
+    specs += [nova.graft(specs[0])[0], every_function]
+    for spec in specs + [_all_indicator_spec()]:
+        parser.parse(pine.to_pine(spec))
+
+
+def test_formats_from_common_exporters_load(tmp_path):
+    df = data.sample(600, seed=3, freq="1min")
+    d = df.index
+    o, h, l, c, v = (df[x].round(2) for x in strat.PRICE_COLUMNS)
+    files = {
+        "tradestation.txt": (pd.DataFrame({"Date": d.strftime("%m/%d/%Y"), "Time": d.strftime("%H%M"),
+                                           "Open": o, "High": h, "Low": l, "Close": c, "Up": v}), {}),
+        "ninja.txt": (pd.DataFrame({0: d.strftime("%Y%m%d %H%M%S"), 1: o, 2: h, 3: l, 4: c, 5: v}),
+                      {"sep": ";", "header": False}),
+        "kibot.txt": (pd.DataFrame({0: d.strftime("%m/%d/%Y"), 1: d.strftime("%H:%M"), 2: o, 3: h,
+                                    4: l, 5: c, 6: v}), {"header": False}),
+        "mt5.csv": (pd.DataFrame({"<DATE>": d.strftime("%Y.%m.%d"), "<TIME>": d.strftime("%H:%M:%S"),
+                                  "<OPEN>": o, "<HIGH>": h, "<LOW>": l, "<CLOSE>": c}), {"sep": "\t"}),
+    }
+    for name, (frame, kw) in files.items():
+        frame.to_csv(tmp_path / name, index=False, **kw)
+        x = data.load_csv(tmp_path / name)
+        assert len(x) == 600 and x.index[0] == d[0] and x.index[-1] == d[-1], name
+        assert len(data.load_csv(tmp_path / name, timeframe="2min")) == 300
+
+
+# ---- invented features, whiteboard, ladder ---------------------------------------------------
+
+from village import features  # noqa: E402
+
+
+def _cols(values, freq="15min"):
+    idx = pd.date_range("2024-01-01 03:00", periods=len(values), freq=freq)
+    return pd.DataFrame({"flag": np.array(values, float), "close": np.arange(len(values)) + 1.0},
+                        index=idx)
+
+
+def test_feature_functions():
+    cols = _cols([0, 1, 0, 0, 1, 0])
+    assert features.evaluate("bars_since(flag)", cols).tolist()[1:] == [0, 1, 2, 0, 1]
+    assert np.isnan(features.evaluate("bars_since(flag)", cols).iloc[0])
+    assert features.evaluate("minutes_since(flag)", cols).tolist()[1:] == [0, 15, 30, 0, 15]
+    assert features.evaluate("count(flag, 3)", cols).tolist()[2:] == [1, 1, 1, 1]
+    assert features.evaluate("prev(close, 2)", cols).iloc[2] == 1
+    dr = features.evaluate("digital_root(close * 9 + 1)", cols)   # 10, 19, 28 ... -> 1
+    assert set(dr) == {1.0}
+    assert features.evaluate("digital_root(close - 1)", cols).iloc[0] == 0
+    both = features.evaluate("flag == 1 and close > 3", cols)
+    assert both.tolist() == [0, 0, 0, 0, 1, 0]
+
+
+def test_day_count_restarts_each_new_york_day():
+    cols = _cols([1] * 8, freq="2h")   # 03:00 UTC = 22:00 New York the day before
+    counts = features.evaluate("day_count(flag)", cols)
+    ny = cols.index.tz_localize("UTC").tz_convert("America/New_York")
+    first_new_day = list(ny.day).index(ny.day[-1])
+    assert counts.iloc[first_new_day] == 1                       # restarted at NY midnight
+    assert counts.iloc[-1] == len(cols) - first_new_day          # and kept counting that day
+
+
+@pytest.mark.parametrize("bad", ["__import__('os')", "close.__class__", "open[1]", "x if y else z",
+                                 "count(close, n)", "foo(1)", "'text'", "(lambda: 1)()"])
+def test_formulas_cannot_run_code(bad):
+    with pytest.raises(features.FeatureError):
+        features.evaluate(bad, _cols([0, 1, 0]))
+
+
+def test_features_never_look_ahead(intraday):
+    spec = {"indicators": [{"id": "sw", "type": "sweep"}],
+            "features": [{"id": "a", "expr": "digital_root(count(sw.bull, 30)) + minutes_since(sw.bear)"},
+                         {"id": "b", "expr": "day_count(sw.bull) * ny_minute() + change(close, 4)"}],
+            "entry_long": [{"left": "a", "op": ">", "right": 3}], "exit_long": []}
+    cut = 700
+    full = strat.build_columns(intraday, spec)
+    future = intraday.copy()
+    future.iloc[cut:, :4] = future.iloc[cut:, :4].to_numpy()[::-1]
+    pd.testing.assert_frame_equal(full.iloc[:cut], strat.build_columns(future, spec).iloc[:cut])
+
+
+def test_pine_translates_features():
+    spec = {"name": "f", "indicators": [{"id": "sw", "type": "sweep"}],
+            "features": [{"id": "dr", "expr": "digital_root(count(sw.bull, 50))"},
+                         {"id": "w", "expr": "minutes_since(sw.bull) + day_count(sw.bear)"}],
+            "entry_long": [{"left": "dr", "op": "==", "right": 7}], "exit_long": []}
+    src = pine.to_pine(spec)
+    assert "i_dr = ft_dr_" in src and "ta.valuewhen" in src and "math.sum" in src
+
+
+def test_never_trading_and_lookalike_strategies_are_rejected(tmp_path, df):
+    v = Village(df, "s", Board(tmp_path / "v.db"), llm=None, log=lambda *_: None)
+    never = {"indicators": [], "entry_long": [{"left": "close", "op": "<", "right": 0}],
+             "exit_long": []}
+    assert "never trades" in v._try(never)[1]
+    base = always_long()
+    ev, err = v._try(base)
+    v._record(1, "x", base, ev)
+    same = dict(base, entry_long=base["entry_long"] + [{"left": "close", "op": ">", "right": -1}])
+    assert "trades exactly like" in v._try(same)[1]
+
+
+def test_inventor_grafts_a_valid_feature(intraday):
+    nova = agents.Inventor("n", rng=random.Random(3), intraday=True)
+    spec = agents.random_spec("ict_liquidity", random.Random(1))
+    for _ in range(10):
+        grafted, idea = nova.graft(spec)
+        assert grafted["features"] and "What if" in idea
+        strat.build_columns(intraday, grafted)
+
+
+def test_ladder_scouts_then_expands(tmp_path):
+    from village import stages
+    df = data.sample(12000, seed=4, freq="15min")
+    board = Board(tmp_path / "v.db")
+    survivors, table = stages.ladder({"m": df}, "m", board, "30D", ["60D", "all"], scout_rounds=2,
+                                     stage_rounds=1, log=lambda *_: None,
+                                     report_dir=str(tmp_path / "r"), quants=agents.TEAMS["ict"],
+                                     seed=1)
+    assert table[0] == "| Setup | 30D | 60D | all |"
+    windows = {r["dataset"] for r in board.db.execute("SELECT dataset FROM strategies")}
+    assert windows == {"m | scout 30D", "m | expand 60D", "m | expand all"}
+    assert survivors and len(table) > 2
+    # Survivors of each step were carried into the next window's board.
+    seeded = board.db.execute("SELECT COUNT(*) FROM strategies WHERE author LIKE 'from %'").fetchone()
+    assert seeded[0] > 0
+    # Every window ends exactly where the vault begins, so the vault stays unseen.
+    train_end = df.index[int(len(df) * 0.7) - 1]
+    for span in ("30D", "60D", "all"):
+        assert stages.window(df, stages.parse_span(span), 0.7).index[-1] == train_end
+    board.close()
+
+
+def test_library_reads_pine_and_subtitles(tmp_path):
+    from village import pdfs
+    (tmp_path / "ind.pine").write_text("//@version=5\nindicator('x')\nplot(ta.sma(close, 20))")
+    (tmp_path / "talk.srt").write_text("1\n00:00:01,000 --> 00:00:03,000\nPrice runs the stops\n\n"
+                                       "2\n00:01:05,500 --> 00:01:07,000\n<i>then it shifts</i>\n")
+    docs = {p.name for p in pdfs.find_documents(tmp_path)}
+    assert docs == {"ind.pine", "talk.srt"}
+    text = pdfs.read_document(tmp_path / "talk.srt")
+    assert "Price runs the stops" in text and "then it shifts" in text and "-->" not in text
+    assert "[00:01]" in text
+    assert pdfs.is_pine(tmp_path / "ind.pine")
+
+
+def test_librarian_uses_pine_prompt_for_indicators(tmp_path):
+    (tmp_path / "ind.pine").write_text("//@version=5\nindicator('x')")
+    seen = []
+
+    class LLM:
+        name = "spy"
+
+        def chat(self, system, user, json_mode=False):
+            seen.append(system)
+            return '{"ideas": ["sma 20 cross"]}'
+
+    board = Board(tmp_path / "v.db")
+    assert agents.Librarian("L", LLM()).study(tmp_path, board, 1) == 1
+    assert "Pine Script source code" in seen[0]
+    board.close()

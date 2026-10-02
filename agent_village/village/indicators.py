@@ -1,5 +1,7 @@
 """Technical indicators. Every function is causal: the value at bar t only uses bars <= t."""
 
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -109,6 +111,32 @@ def compute(df: pd.DataFrame, kind: str, params: dict) -> pd.DataFrame:
     if kind == "stoch_k":
         return stoch_k(df, int(p["period"])).to_frame("value")
     return zscore(close, int(p["period"])).to_frame("value")
+
+
+class Cache:
+    """Remembers recently computed indicators for ONE data frame (least recently used first out).
+
+    The tuner and analyst re-test small variations of the same strategy, so most of their
+    indicators are already computed. Keep one Cache per market and never share it between frames.
+    """
+
+    def __init__(self, max_mb: float = 600):
+        self.max_bytes = max_mb * 1e6
+        self.items: dict = {}
+        self.bytes = 0
+
+    def get(self, df: pd.DataFrame, kind: str, params: dict) -> pd.DataFrame:
+        key = (kind, json.dumps(params, sort_keys=True, default=str))
+        if key in self.items:
+            self.items[key] = self.items.pop(key)  # mark as recently used
+            return self.items[key]
+        out = compute(df, kind, params)
+        self.items[key] = out
+        self.bytes += out.memory_usage(index=False).sum()
+        while self.bytes > self.max_bytes and len(self.items) > 1:
+            old = self.items.pop(next(iter(self.items)))
+            self.bytes -= old.memory_usage(index=False).sum()
+        return out
 
 
 def catalog_text() -> str:

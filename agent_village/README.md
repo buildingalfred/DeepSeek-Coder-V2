@@ -4,6 +4,44 @@ A village of AI agents that research trading strategies together. They read your
 strategies from indicators, backtest them on your price data, criticise each other, and get better
 round after round. It runs on your own computer.
 
+## Quick start for your own research (futures data, PDFs, videos, Pine indicators)
+
+Put your files in these folders inside `agent_village`:
+
+```
+data/      NQ, ES, YM price files (.csv or .txt; 1-minute is fine, any common export format)
+papers/    PDFs, notes, your Pine Script indicators (.pine or .txt), subtitles (.srt/.vtt)
+videos/    videos or audio (.mp4, .mkv, .mov, .mp3 ...)
+```
+
+Then double-click **`research.bat`** (Windows), or run the steps yourself:
+
+```
+pip install -r requirements.txt -r requirements-extra.txt
+python -m village transcribe videos                 # videos -> text in papers/transcripts
+python -m village run --data data --timeframe 15min --tz America/New_York --team mixed ^
+       --scout 3M --expand 6M,1Y,3Y,10Y,all --rounds 20
+```
+
+(On Mac/Linux write the command on one line, or use `\` instead of `^`.) Set `--tz` to the time
+zone your data's times are in: many futures exports use exchange time (`America/Chicago`) or New
+York time. When it's done, open the newest `.html` file in `reports/`, and paste
+`reports/best_strategy.pine` into TradingView.
+
+What happens:
+
+1. **The Librarian reads everything** in `papers/`: PDFs, transcripts, and your Pine indicators
+   (for those she works out exactly what they compute and when they signal).
+2. **Scout:** the team hunts on the last 3 months before the vault. Small data, fast rounds.
+3. **Expand:** setups that work climb a ladder: 6 months, 1 year, 3 years, 10 years, all. At each
+   step the team gets a few rounds to adapt them, and only setups that still work, including on
+   the step's own unseen part, climb on. The report shows the ladder.
+4. **The final run** on all data starts from the survivors and ends by opening the vault: the
+   most recent 30% of your history, which nobody touched until then.
+5. **Pine Script:** the best setup that held up is written to `reports/best_strategy.pine`.
+   It plots every setup on the chart, sends alerts, and runs in TradingView's Strategy Tester
+   with the same logic as the village.
+
 ## Who lives in the village
 
 | Villager | Job |
@@ -12,6 +50,7 @@ round after round. It runs on your own computer.
 | **Tom** (trend), **Rita** (mean reversion), **Bo** (breakout) | Quants. Each round, each one proposes a strategy in their own style, building on the board's ideas, the leaderboard and the critic's notes. |
 | **The Backtester** | Not an AI. It runs every strategy on your data, with fees, and fills orders at the next bar's open so nobody can cheat by seeing the future. |
 | **Tess the Tuner** | Not an AI. Each round she tries a dozen small variations of a leading strategy's numbers and keeps one only if it is clearly better. |
+| **Nova the Inventor** | The imagination. She writes new hypotheses on the whiteboard and grafts invented features onto the leaders (e.g. "digital root of the number of structure breaks", "minutes since the last sweep", "second FVG of the day") so every round at least one new idea gets tested. |
 | **Carl the Critic** | Reviews each round: too few trades, deep drawdowns, losing to buy & hold, overfitting. |
 | **Maya the Mayor** | Writes the final report and opens **the vault**. |
 
@@ -20,12 +59,26 @@ round after round. It runs on your own computer.
 that only works on the train period was overfit, meaning it memorised noise. This is the honest
 check that tells you whether the village found something real.
 
+**The whiteboard:** a shared board where everyone writes what they notice: "AHA: new leader...",
+"this piece is ESSENTIAL", "dead end: this hurts", Nova's hypotheses, and the AI agents' own notes.
+Everyone reads it every round, so the team builds on each other's findings. It is in the report.
+
+**Invented features:** agents can create their own measurements with small formulas, for
+example `digital_root(count(st.bos_up, 50))`, `minutes_since(sw.bull)`, `day_count(fvg.bull)`
+(how many FVGs so far today), `ny_minute()` (time of day), `bars_since(...)`, `prev(...)`,
+`change(...)`, rolling `mean/sum/highest/lowest/std`, `where(...)`, arithmetic and comparisons.
+Only these building blocks are allowed (no code), they only look backwards in time, and they are
+translated into the Pine Script too.
+
 **The robust score:** the leaderboard does not just reward the most profit. It splits the train
 period into slices and ranks strategies by how well they did in *every* slice (and every market),
 minus a penalty when the slices disagree. A strategy that made all its money in one lucky year
 ranks below one that earned steadily. The village also refuses to test the exact same rules
 twice, and the report says how many strategies were tried in total. The more tries, the more
 likely the winner is just lucky.
+
+The village also rejects strategies that never trade, and ones that trade *exactly* like one it
+already has (extra rules that change nothing are not a discovery).
 
 Everything the village learns is stored in `village.db`. Run it again and it continues where it
 stopped.
@@ -100,6 +153,9 @@ strategy that held up in the vault is saved to `reports/best_strategy.json`.
 python -m village board --data data/SPY_1d.csv        # leaderboard + latest critique
 python -m village backtest my_strategy.json --data data/SPY_1d.csv
 python -m village fetch EURUSD=X --period 10y        # download more data
+python -m village pine reports/best_strategy.json    # strategy -> TradingView Pine Script
+python -m village pine --id 42                       # or any strategy from the board
+python -m village transcribe videos                  # videos -> text for the Librarian
 python -m village sample --out data/sample.csv        # write synthetic data
 python -m village run --help                          # every option
 ```
@@ -155,6 +211,16 @@ therefore has a **t-stat**, and the report shows the "luck bar": the t-stat the 
 tried strategies would reach with no edge at all. A strategy only counts as a real find when it
 holds up in the vault with a vault t-stat of 2 or more. Otherwise it is marked "could be luck".
 
+## Speed and big data
+
+18 years of 1-minute bars is about 6 million bars per market. Loading takes some seconds per
+file; after that use `--timeframe` (5min, 15min, 1h ...) for the research. With `numba`
+installed (`pip install numba`, also in requirements-extra.txt) the backtester and the ICT zones are compiled, and
+indicators are cached between variations. On the developer's test machine, three markets of
+two years of 1-minute data (15min research) ran the full scout, expand and final chain in about
+20 seconds without an AI. With a local AI each agent's turn takes as long as the model needs to
+answer, so the AI is the slow part, not the backtests.
+
 ## How strategies look
 
 The agents write strategies as JSON, never as code, so nothing they produce can run on your
@@ -191,6 +257,10 @@ village/
   strategy.py    the strategy JSON format and its validation
   indicators.py  technical indicators
   ict.py         ICT building blocks (sweeps, FVGs, order blocks, kill zones, ...)
+  features.py    the formula language for invented features (and its Pine translation)
+  stages.py      scout-then-expand ladder
+  pine.py        export to TradingView Pine Script
+  fast.py        compiled hot loops (numba)
   pdfs.py        reading PDFs and notes
   board.py       shared memory (SQLite)
   llm.py         Ollama / Claude / none

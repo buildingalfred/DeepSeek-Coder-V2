@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from . import fast
 from . import strategy as strat
 
 
@@ -32,9 +33,12 @@ def bars_per_year(index: pd.Index) -> float:
     return 252.0
 
 
-def run(df: pd.DataFrame, spec: dict, fee_bps: float = 5.0, train_frac: float = 0.7) -> Result:
-    """Backtest a spec. Metrics are reported separately for the train and the unseen test period."""
-    sig = strat.signals(df, spec)
+def run(df: pd.DataFrame, spec: dict, fee_bps: float = 5.0, train_frac: float = 0.7,
+        cache=None) -> Result:
+    """Backtest a spec. Metrics are reported separately for the train and the unseen test period.
+
+    cache: optional indicators.Cache, so repeated backtests on the same data reuse indicators."""
+    sig = strat.signals(df, spec, cache)
     open_ = df["open"].to_numpy(float)
     close = df["close"].to_numpy(float)
     n = len(df)
@@ -42,43 +46,14 @@ def run(df: pd.DataFrame, spec: dict, fee_bps: float = 5.0, train_frac: float = 
     stop = (spec.get("stop_loss_pct") or 0) / 100
     take = (spec.get("take_profit_pct") or 0) / 100
 
-    pos = np.zeros(n)          # position held during bar t (from its open)
-    rets = np.zeros(n)         # strategy return of bar t, net of fees
-    trades = []
-    cur, entry_px, entry_i = 0, 0.0, -1
-    for t in range(1, n):
-        # Decide the target using information up to the close of t-1.
-        target = cur
-        p = t - 1
-        if cur != 0:
-            move = (close[p] / entry_px - 1) * cur
-            hit = (stop and move <= -stop) or (take and move >= take)
-            if cur == 1 and (sig["exit_long"][p] or sig["entry_short"][p] or hit):
-                target = -1 if sig["entry_short"][p] and not hit else 0
-            elif cur == -1 and (sig["exit_short"][p] or sig["entry_long"][p] or hit):
-                target = 1 if sig["entry_long"][p] and not hit else 0
-        elif sig["entry_long"][p]:
-            target = 1
-        elif sig["entry_short"][p]:
-            target = -1
-
-        # Overnight gap belongs to the old position, the bar's own move to the new one.
-        gap = open_[t] / close[p] - 1
-        intrabar = close[t] / open_[t] - 1
-        rets[t] = (1 + cur * gap) * (1 + target * intrabar) - 1 - fee * abs(target - cur)
-        if target != cur:
-            if cur != 0:
-                pnl = (open_[t] / entry_px - 1) * cur - 2 * fee
-                trades.append({"side": "long" if cur == 1 else "short", "entry_i": entry_i,
-                               "exit_i": t, "pnl_pct": round(pnl * 100, 3)})
-            if target != 0:
-                entry_px, entry_i = open_[t], t
-            cur = target
-        pos[t] = cur
-    if cur != 0:
-        pnl = (close[-1] / entry_px - 1) * cur - 2 * fee
-        trades.append({"side": "long" if cur == 1 else "short", "entry_i": entry_i,
-                       "exit_i": n - 1, "pnl_pct": round(pnl * 100, 3), "open": True})
+    rets, pos, side, entry_i, exit_i, pnl, open_trade = fast.simulate(
+        open_, close, sig["entry_long"], sig["exit_long"], sig["entry_short"], sig["exit_short"],
+        fee, stop, take)
+    trades = [{"side": "long" if side[i] == 1 else "short", "entry_i": int(entry_i[i]),
+               "exit_i": int(exit_i[i]), "pnl_pct": round(float(pnl[i]) * 100, 3)}
+              for i in range(len(side))]
+    if open_trade:
+        trades[-1]["open"] = True
 
     split = int(n * train_frac)
     bpy = bars_per_year(df.index)
@@ -138,13 +113,16 @@ def chunk_sharpes(result: Result, chunks: int = 3) -> list[float]:
     return out
 
 
-def evaluate(markets: dict, spec: dict, fee_bps: float = 5.0, train_frac: float = 0.7) -> dict:
+def evaluate(markets: dict, spec: dict, fee_bps: float = 5.0, train_frac: float = 0.7,
+             caches: dict | None = None) -> dict:
     """Backtest one spec on every market and combine the results.
 
     Returns {"train": {...}, "test": {...}, "markets": {name: {"train", "test"}}}. The combined
     train metrics include "robust_sharpe" (see robust_sharpe) which is what the leaderboard ranks.
     """
-    results = {name: run(df, spec, fee_bps, train_frac) for name, df in markets.items()}
+    caches = caches or {}
+    results = {name: run(df, spec, fee_bps, train_frac, caches.get(name))
+               for name, df in markets.items()}
     pieces = [s for r in results.values() for s in chunk_sharpes(r)]
     train = combine([r.train for r in results.values()])
     train["robust_sharpe"] = robust_sharpe(pieces)

@@ -11,22 +11,46 @@ from .board import Board
 from .village import Village
 
 
-def load_markets(paths: list[str], tz: str = "UTC"):
-    """Turn --data arguments (files, folders, or 'sample') into ({name: frame}, dataset name)."""
-    if not paths or paths == ["sample"]:
-        return {"sample": data.sample()}, "sample"
+def data_files(paths: list[str]) -> list[Path]:
     files = []
     for p in map(Path, paths):
-        files += sorted(p.glob("*.csv")) if p.is_dir() else [p]
+        files += (sorted(f for f in p.iterdir() if f.suffix.lower() in data.DATA_SUFFIXES)
+                  if p.is_dir() else [p])
     if not files:
-        sys.exit(f"No CSV files found in {paths}")
+        sys.exit(f"No .csv or .txt files found in {paths}")
+    return files
+
+
+def dataset_name(paths: list[str], timeframe: str | None = None) -> str:
+    """The village's memory is kept per dataset: these files at this timeframe."""
+    if not paths or paths == ["sample"]:
+        name = "sample"
+    else:
+        name = "+".join(sorted(f.name for f in data_files(paths)))
+    return f"{name} @{timeframe}" if timeframe else name
+
+
+def load_markets(paths: list[str], tz: str = "UTC", timeframe: str | None = None):
+    """Turn --data arguments (files, folders, or 'sample') into ({name: frame}, dataset name)."""
+    if not paths or paths == ["sample"]:
+        df = data.sample()
+        return {"sample": data.resample(df, timeframe) if timeframe else df}, \
+            dataset_name(paths, timeframe)
+    files = data_files(paths)
     markets = {}
+    from_folder = any(Path(p).is_dir() for p in paths)
     for f in files:
         try:
-            markets[f.name] = data.load_csv(f, tz)
-        except (OSError, ValueError) as e:
-            sys.exit(f"Could not load {f}: {e}")
-    return markets, "+".join(sorted(markets))
+            print(f"Loading {f.name} ...", flush=True)
+            markets[f.name] = data.load_csv(f, tz, timeframe)
+        except (OSError, ValueError, KeyError, IndexError) as e:
+            if not from_folder:
+                sys.exit(f"Could not load {f}: {e}")
+            print(f"  skipping {f.name}: not price data ({str(e)[:120]})")
+    if not markets:
+        sys.exit(f"No price data could be loaded from {paths}")
+    name = "+".join(sorted(markets))
+    return markets, f"{name} @{timeframe}" if timeframe else name
 
 
 def load(path):
@@ -37,7 +61,7 @@ def load(path):
 
 
 def cmd_run(a):
-    markets, name = load_markets(a.data, a.tz)
+    markets, name = load_markets(a.data, a.tz, a.timeframe)
     try:
         brain = llm.make(a.llm)
     except ImportError:
@@ -48,15 +72,29 @@ def cmd_run(a):
     try:
         quants = a.quants.split(",") if a.quants else TEAMS[a.team]
         mission = a.mission if a.mission is not None else (ICT_MISSION if "ict" in a.team else "")
-        village = Village(markets, name, board, brain, quants=quants, fee_bps=a.fee_bps,
-                          train_frac=a.train, seed=a.seed, tuner=not a.no_tuner, mission=mission)
+        kw = dict(llm=brain, quants=quants, fee_bps=a.fee_bps, train_frac=a.train, seed=a.seed,
+                  tuner=not a.no_tuner, mission=mission)
+        survivors, table = [], []
+        if a.scout:
+            from .stages import ladder
+            if a.papers:  # read the library once, before scouting
+                Village(markets, name, board, **kw).librarian.study(a.papers, board, board.last_round())
+            survivors, table = ladder(markets, name, board, a.scout,
+                                      [x for x in a.expand.split(",") if x], a.scout_rounds,
+                                      a.stage_rounds, report_dir=a.reports, **kw)
+            print("\nThe ladder (robust score / unseen-part sharpe at each window):")
+            print("\n".join(table))
+        village = Village(markets, name, board, **kw)
+        if survivors:
+            village.seed(survivors, "ladder survivor")
+            board.post(board.last_round(), "ladder", "ladder", "\n".join(table), name)
         village.run(a.rounds, a.papers, a.reports)
     finally:
         board.close()
 
 
 def cmd_backtest(a):
-    markets, _ = load_markets(a.data, a.tz)
+    markets, _ = load_markets(a.data, a.tz, a.timeframe)
     spec = json.loads(Path(a.spec).read_text(encoding="utf-8"))
     print(json.dumps(backtest.evaluate(markets, spec, a.fee_bps, a.train), indent=2))
 
@@ -64,7 +102,7 @@ def cmd_backtest(a):
 def cmd_board(a):
     board = Board(a.db)
     try:
-        name = load_markets(a.data)[1]
+        name = dataset_name(a.data, a.timeframe)
         print(leaderboard_text(board.leaderboard(name, a.top)))
         for note in board.notes("critique", 1, name):
             print(f"\nLatest critique (round {note['round']}):\n{note['content']}")
@@ -78,6 +116,39 @@ def cmd_sample(a):
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(a.out)
     print(f"Wrote {len(df)} synthetic bars to {a.out}")
+
+
+def cmd_pine(a):
+    from . import pine, strategy
+    if a.id is not None:
+        board = Board(a.db)
+        try:
+            row = board.db.execute("SELECT * FROM strategies WHERE id = ?", (a.id,)).fetchone()
+        finally:
+            board.close()
+        if row is None:
+            sys.exit(f"No strategy #{a.id} in {a.db}")
+        spec, stats = json.loads(row["spec"]), {"train": json.loads(row["train"] or "null"),
+                                                "vault": json.loads(row["test"] or "null")}
+    else:
+        spec, stats = json.loads(Path(a.spec).read_text(encoding="utf-8")), None
+    # Validate against sample data first, so a broken spec fails here and not in TradingView.
+    try:
+        strategy.signals(data.sample(400, freq="15min"), spec)
+    except strategy.SpecError as e:
+        sys.exit(f"Invalid strategy: {e}")
+    out = Path(a.out or (Path(a.spec).with_suffix(".pine") if a.spec else f"strategy_{a.id}.pine"))
+    out.write_text(pine.to_pine(spec, a.fee_bps, stats), encoding="utf-8")
+    print(f"Wrote {out}. In TradingView: Pine Editor -> paste -> Add to chart -> Strategy Tester.")
+
+
+def cmd_transcribe(a):
+    from .pdfs import transcribe
+    try:
+        n = transcribe(a.folder, a.out, a.model)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    print(f"Done: {n} new transcript(s) in {a.out}. The Librarian reads them on the next run.")
 
 
 def cmd_fetch(a):
@@ -107,6 +178,9 @@ def main(argv=None):
         sp.add_argument("--tz", default="UTC",
                         help="time zone the CSV times are in, e.g. UTC, America/New_York, "
                              "Europe/London (used by the ICT kill-zone indicators)")
+        sp.add_argument("--timeframe", default=None,
+                        help="resample after loading, e.g. 5min, 15min, 1h, 4h, 1D "
+                             "(recommended for years of 1-minute data)")
         sp.add_argument("--train", type=float, default=0.7,
                         help="fraction of bars the agents may see (rest is the vault)")
 
@@ -125,6 +199,13 @@ def main(argv=None):
     r.add_argument("--reports", default="reports")
     r.add_argument("--seed", type=int, default=None)
     r.add_argument("--no-tuner", action="store_true", help="leave out the tuner villager")
+    r.add_argument("--scout", default=None,
+                   help="start small: hunt on this much recent data first, e.g. 3M or 90D")
+    r.add_argument("--expand", default="6M,1Y,3Y,all",
+                   help="then test survivors on longer windows (default 6M,1Y,3Y,all)")
+    r.add_argument("--scout-rounds", type=int, default=8)
+    r.add_argument("--stage-rounds", type=int, default=3,
+                   help="rounds the team gets to adapt setups at each expansion step")
     r.set_defaults(fn=cmd_run)
 
     b = sub.add_parser("backtest", help="backtest one strategy JSON file")
@@ -134,6 +215,7 @@ def main(argv=None):
 
     lb = sub.add_parser("board", help="show the leaderboard and latest critique")
     lb.add_argument("--data", nargs="+", default=["sample"])
+    lb.add_argument("--timeframe", default=None)
     lb.add_argument("--db", default="village.db")
     lb.add_argument("--top", type=int, default=10)
     lb.set_defaults(fn=cmd_board)
@@ -144,6 +226,22 @@ def main(argv=None):
     s.add_argument("--seed", type=int, default=None)
     s.add_argument("--freq", default="B", help="bar size: B (business days, default), 1h, 15min ...")
     s.set_defaults(fn=cmd_sample)
+
+    pn = sub.add_parser("pine", help="turn a strategy into a TradingView Pine Script")
+    pn.add_argument("spec", nargs="?", default="reports/best_strategy.json",
+                    help="strategy JSON file (default reports/best_strategy.json)")
+    pn.add_argument("--id", type=int, default=None, help="or a strategy number from the board")
+    pn.add_argument("--db", default="village.db")
+    pn.add_argument("--fee-bps", type=float, default=5.0)
+    pn.add_argument("--out", default=None)
+    pn.set_defaults(fn=cmd_pine)
+
+    tr = sub.add_parser("transcribe", help="turn videos into text for the Librarian (offline)")
+    tr.add_argument("folder", nargs="?", default="videos")
+    tr.add_argument("--out", default="papers/transcripts")
+    tr.add_argument("--model", default="small",
+                    help="Whisper size: tiny, base, small (default), medium, large-v3")
+    tr.set_defaults(fn=cmd_transcribe)
 
     f = sub.add_parser("fetch", help="download prices from Yahoo Finance (needs yfinance)")
     f.add_argument("symbol", help="e.g. SPY, AAPL, BTC-USD, EURUSD=X, ^GSPC")

@@ -8,3 +8,5 @@ data/*
 papers/*
 !papers/.gitkeep
 .env
+videos/*
+!videos/.gitkeep

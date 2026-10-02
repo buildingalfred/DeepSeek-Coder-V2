@@ -1,0 +1,6 @@
+# Makes backtests on years of intraday data 5-15x faster. Without it everything still works.
+numba>=0.58
+# Turns videos into text for the Librarian (python -m village transcribe).
+faster-whisper>=1.0
+# Lets the slow test check Pine Script syntax (VILLAGE_SLOW=1 python -m pytest).
+pynescript>=0.2

@@ -14,7 +14,7 @@ import json
 import random
 import re
 
-from . import ict, indicators, pdfs
+from . import features, ict, indicators, pdfs
 from . import strategy as strat
 from .llm import LLMError
 
@@ -39,6 +39,10 @@ Indicators available:
 {indicators.catalog_text()}
 
 {ict.GUIDE}
+
+{features.GUIDE}
+
+Optionally add "whiteboard": "one short note for the team" (an observation, a hunch, an "aha").
 
 Signals are checked at each bar's close and filled at the next bar's open. Fees are charged."""
 
@@ -98,7 +102,12 @@ class Librarian(Agent):
         super().__init__(name, llm, log)
         self.mission = mission
 
-    def study(self, folder, board, round_: int, max_chunks: int = 6) -> int:
+    PINE = ("This document is TradingView Pine Script source code. Read it like an engineer: "
+            "state exactly what it computes and when it signals (conditions, lookbacks, "
+            "thresholds, sessions, time zones), then say how each part maps onto the village's "
+            "building blocks or a formula. Note anything clever or unusual it does.")
+
+    def study(self, folder, board, round_: int, max_chunks: int = 12) -> int:
         """Read every document not read before and post its ideas. Returns number of new ideas."""
         found = 0
         for path in pdfs.find_documents(folder):
@@ -112,8 +121,9 @@ class Librarian(Agent):
                 continue
             self.log(f"  [{self.name}] reading {source} ({len(text):,} chars)")
             ideas = []
+            pine = pdfs.is_pine(path, text)
             for piece in pdfs.chunks(text)[:max_chunks]:
-                ideas += self._ideas_from(piece, source)
+                ideas += self._ideas_from(piece, source, pine)
             if not ideas:
                 ideas = self._keyword_ideas(text, source)
             for idea in ideas:
@@ -122,8 +132,10 @@ class Librarian(Agent):
             found += len(ideas)
         return found
 
-    def _ideas_from(self, piece: str, source: str) -> list[str]:
+    def _ideas_from(self, piece: str, source: str, pine: bool = False) -> list[str]:
         system = self.SYSTEM + (f"\n\nThe village's mission: {self.mission}" if self.mission else "")
+        if pine:
+            system += "\n\n" + self.PINE
         reply = self.ask(system,
                          f"Text from '{source}':\n\n{piece}\n\nReturn JSON: "
                          '{"ideas": ["idea with concrete rule and parameters", ...]} '
@@ -224,8 +236,12 @@ class Quant(Agent):
                   f"Critic's latest notes:\n{ctx['critique'] or '(none yet)'}\n\n"
                   f"Analyst's findings (which pieces of the leaders matter):\n"
                   f"{ctx.get('analysis') or '(none yet)'}\n\n"
+                  f"The team whiteboard (hunches, findings, dead ends):\n"
+                  f"{ctx.get('whiteboard') or '(empty)'}\n\n"
                   f"Your recent attempts:\n{ctx['mine'] or '(none)'}\n\n"
-                  "Propose ONE new strategy that you think will beat the leaderboard.")
+                  "Propose ONE new strategy that you think will beat the leaderboard. Test a "
+                  "hypothesis from the whiteboard, or build on what the analyst found essential. "
+                  "Be inventive: you can create your own features with formulas.")
         if error:
             prompt += (f"\n\nYour previous reply was rejected by the backtester:\n{error}\n"
                        f"Previous reply:\n{previous}\nFix it and reply with the corrected JSON.")
@@ -245,6 +261,86 @@ class Quant(Agent):
             spec["name"] = f"{base_name(spec.get('name', 'leader'))} (tweaked by {self.name.split()[0]})"
             return spec
         return random_spec(self.style, self.rng, self.name, intraday=self.intraday)
+
+
+INVENTED = [
+    # (feature formula, condition op, candidate thresholds) - imagination for the no-LLM village
+    ("digital_root(count({flag}, {n}))", "==", [1, 3, 5, 7, 9]),
+    ("bars_since({flag})", "<=", [2, 5, 10, 20]),
+    ("count({flag}, {n})", ">=", [1, 2, 3]),
+    ("day_count({flag})", "<=", [1, 2]),
+    ("mod(bars_since({flag}), 3)", "==", [0, 1, 2]),
+    ("change(close, {m}) / prev(close, {m}) * 100", ">", [0, 0.1, 0.25]),
+    ("(high - low) / mean(high - low, {n})", ">", [1.0, 1.5, 2.0]),
+]
+INVENTED_TIME = [
+    ("minutes_since({flag})", "<=", [15, 30, 60, 120]),
+    ("ny_minute()", ">=", [120, 420, 570, 600, 810]),
+    ("ny_minute()", "<=", [300, 600, 660, 900]),
+    ("day_of_week()", "<=", [1, 2, 3]),
+]
+FLAGS = [("sweep", ["bull", "bear"]), ("structure", ["bos_up", "bos_down", "mss_up", "mss_down"]),
+         ("fvg", ["bull", "bear"]), ("displacement", ["up", "down"])]
+
+
+class Inventor(Agent):
+    """Nova the Inventor: the village's imagination. With an LLM she writes new hypotheses on the
+    whiteboard (with invented features). She also takes the leader and bolts on one invented
+    filter, so every round at least one wild idea gets tested."""
+    role = "inventor"
+    SYSTEM = ("You are Nova, the Inventor in a village of trading researchers. Your job is "
+              "imagination: invent new, specific, testable hypotheses about how price behaves, "
+              "especially hidden structure in timing and counting (minutes between events, how "
+              "many swings formed before a move, digital roots, which weekday or minute of the "
+              "session, sequences of sweeps and shifts). Build on the whiteboard and the "
+              "analyst's findings; do not repeat dead ends. Each hypothesis must be expressible "
+              "with the village's formula language.\n\n" + features.GUIDE + "\n\n" + ict.GUIDE)
+
+    def __init__(self, name, llm=None, log=print, rng=None, intraday=False, mission=""):
+        super().__init__(name, llm, log)
+        self.rng = rng or random.Random()
+        self.intraday = intraday
+        self.mission = mission
+
+    def brainstorm(self, ctx: dict) -> list[str]:
+        mission = f"Mission: {self.mission}\n\n" if self.mission else ""
+        reply = self.ask(self.SYSTEM,
+                         f"{mission}Market: {ctx['data_summary']}\n\nWhiteboard:\n"
+                         f"{ctx.get('whiteboard') or '(empty)'}\n\nLeaderboard:\n{ctx['leaderboard']}"
+                         f"\n\nAnalyst:\n{ctx.get('analysis') or '(none)'}\n\nLibrary ideas:\n"
+                         f"{ctx['ideas'] or '(none)'}\n\nReturn JSON: {{\"hypotheses\": [\"...\"]}} with "
+                         "3 hypotheses, each naming the formula to test.", json_mode=True)
+        if not reply:
+            return []
+        try:
+            data = strat.extract_json(reply)
+        except strat.SpecError:
+            return []
+        items = data.get("hypotheses", []) if isinstance(data, dict) else data
+        return [str(h)[:400] for h in items if h][:3] if isinstance(items, list) else []
+
+    def graft(self, spec: dict) -> tuple[dict, str]:
+        """Copy a strategy and add one invented feature filter to its entry. Returns (spec, idea)."""
+        spec = copy.deepcopy(spec)
+        side = "entry_long" if spec.get("entry_long") else "entry_short"
+        pool = INVENTED + (INVENTED_TIME if self.intraday else [])
+        formula, op, values = self.rng.choice(pool)
+        kind, outs = self.rng.choice(FLAGS)
+        inds = spec.setdefault("indicators", [])
+        have = next((i["id"] for i in inds if i.get("type") == kind and set(i) <= {"id", "type", "k"}),
+                    None)
+        if "{flag}" in formula and not have:
+            have = f"nv{len(inds)}"
+            inds.append({"id": have, "type": kind})
+        flag = f"{have}.{self.rng.choice(outs)}" if have else "close"
+        expr = (formula.replace("mod(bars_since({flag}), 3)", "bars_since({flag}) % 3")
+                .format(flag=flag, n=self.rng.choice([10, 20, 50, 100]), m=self.rng.choice([3, 6, 12])))
+        fid = f"nova{len(spec.get('features') or [])}"
+        spec.setdefault("features", []).append({"id": fid, "expr": expr})
+        threshold = self.rng.choice(values)
+        spec[side] = list(spec.get(side) or []) + [{"left": fid, "op": op, "right": threshold}]
+        spec["name"] = f"{base_name(spec.get('name', 'leader'))} + {expr} {op} {threshold}"[:110]
+        return spec, f"What if '{expr} {op} {threshold}' filters the leader's entries?"
 
 
 class Analyst(Agent):

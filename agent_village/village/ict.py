@@ -10,6 +10,8 @@ Flags are 1.0 / 0.0. Zone levels are NaN when no zone is active.
 import numpy as np
 import pandas as pd
 
+from . import fast
+
 NY = "America/New_York"
 
 
@@ -61,26 +63,9 @@ def fvg(df: pd.DataFrame, min_atr: float = 0.0) -> pd.DataFrame:
     """Fair value gaps (3-candle imbalances). bull/bear flag the bar a gap forms; the *_top/*_bot
     columns hold the most recent gap that price has not closed through yet."""
     h, l, c = (df[x].to_numpy(float) for x in ("high", "low", "close"))
-    atr = _atr(df).to_numpy(float)
-    n = len(df)
-    out = {k: np.full(n, np.nan) for k in ("bull_top", "bull_bot", "bear_top", "bear_bot")}
-    bull_new, bear_new = np.zeros(n), np.zeros(n)
-    bt = bb = st = sb = np.nan
-    for t in range(n):
-        # Gaps must be at least min_atr x ATR wide (no filter when min_atr is 0).
-        need = min_atr * atr[t] if min_atr > 0 else 0.0
-        if t >= 2 and not np.isnan(need):
-            if l[t] - h[t - 2] > need:
-                bt, bb, bull_new[t] = l[t], h[t - 2], 1.0
-            if l[t - 2] - h[t] > need:
-                st, sb, bear_new[t] = l[t - 2], h[t], 1.0
-        if not np.isnan(bb) and c[t] < bb:   # closed through: the gap failed
-            bt = bb = np.nan
-        if not np.isnan(st) and c[t] > st:
-            st = sb = np.nan
-        out["bull_top"][t], out["bull_bot"][t] = bt, bb
-        out["bear_top"][t], out["bear_bot"][t] = st, sb
-    return pd.DataFrame({"bull": bull_new, "bear": bear_new, **out}, index=df.index)
+    out = fast.fvg_zones(h, l, c, _atr(df).to_numpy(float), float(min_atr))
+    names = ["bull", "bear", "bull_top", "bull_bot", "bear_top", "bear_bot"]
+    return pd.DataFrame(dict(zip(names, out)), index=df.index)
 
 
 def order_block(df: pd.DataFrame, k: int = 3, lookback: int = 10) -> pd.DataFrame:
@@ -88,28 +73,10 @@ def order_block(df: pd.DataFrame, k: int = 3, lookback: int = 10) -> pd.DataFram
     a bullish zone (and the mirror for bearish). A zone dies when price closes through it."""
     st = structure(df, k)
     o, h, l, c = (df[x].to_numpy(float) for x in ("open", "high", "low", "close"))
-    up, down = st["bos_up"].to_numpy(), st["bos_down"].to_numpy()
-    n = len(df)
-    out = {k_: np.full(n, np.nan) for k_ in ("bull_top", "bull_bot", "bear_top", "bear_bot")}
-    bt = bb = rt = rb = np.nan
-    for t in range(n):
-        if up[t]:
-            for j in range(t - 1, max(-1, t - 1 - lookback), -1):
-                if c[j] < o[j]:
-                    bt, bb = h[j], l[j]
-                    break
-        if down[t]:
-            for j in range(t - 1, max(-1, t - 1 - lookback), -1):
-                if c[j] > o[j]:
-                    rt, rb = h[j], l[j]
-                    break
-        if not np.isnan(bb) and c[t] < bb:
-            bt = bb = np.nan
-        if not np.isnan(rt) and c[t] > rt:
-            rt = rb = np.nan
-        out["bull_top"][t], out["bull_bot"][t] = bt, bb
-        out["bear_top"][t], out["bear_bot"][t] = rt, rb
-    return pd.DataFrame(out, index=df.index)
+    out = fast.order_block_zones(o, h, l, c, st["bos_up"].to_numpy(float),
+                                 st["bos_down"].to_numpy(float), int(lookback))
+    names = ["bull_top", "bull_bot", "bear_top", "bear_bot"]
+    return pd.DataFrame(dict(zip(names, out)), index=df.index)
 
 
 def premium_discount(df: pd.DataFrame, k: int = 3) -> pd.DataFrame:
