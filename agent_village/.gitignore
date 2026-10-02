@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+village.db
+reports/
+data/*
+!data/.gitkeep
+papers/*
+!papers/.gitkeep
+.env
