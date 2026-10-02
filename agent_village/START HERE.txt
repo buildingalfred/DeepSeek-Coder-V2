@@ -7,7 +7,8 @@ AGENT VILLAGE - START HERE
    - Optional but recommended, a free local AI brain:
      install Ollama from https://ollama.com, then open Command Prompt and run:
          ollama pull qwen2.5:14b
-     (Without an AI the village still runs, using its built-in random search.)
+     The village finds the model by itself. Without an AI it still runs,
+     using its built-in random search.
 
 2) PUT IN YOUR FILES
    data\     your NQ / ES / YM price files (.csv or .txt, 1-minute is fine)

@@ -621,3 +621,12 @@ def test_live_view_serves_the_village(tmp_path, intraday):
     assert "Agent Village" in page and "whiteboard" in page.lower()
     data_ = json.loads(urllib.request.urlopen(url + "state").read())
     assert data_["dataset"] == "s"
+
+
+def test_auto_brain_uses_an_installed_ollama_model(monkeypatch):
+    from village import llm
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(llm.OllamaLLM, "installed", staticmethod(lambda host=None: ["qwen2.5:14b"]))
+    assert llm.make("auto").model == "qwen2.5:14b"
+    monkeypatch.setattr(llm.OllamaLLM, "installed", staticmethod(lambda host=None: []))
+    assert llm.make("auto") is None

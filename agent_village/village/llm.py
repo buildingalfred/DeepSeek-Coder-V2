@@ -47,6 +47,18 @@ class OllamaLLM:
         return r.json()["message"]["content"]
 
     @staticmethod
+    def installed(host: str | None = None) -> list[str]:
+        """Names of the models installed in Ollama (empty if Ollama is not running)."""
+        host = (host or os.environ.get("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+        if not host.startswith("http"):
+            host = "http://" + host
+        try:
+            r = requests.get(f"{host}/api/tags", timeout=2)
+            return [m["name"] for m in r.json().get("models", [])] if r.ok else []
+        except (requests.RequestException, ValueError, KeyError):
+            return []
+
+    @staticmethod
     def available(host: str | None = None) -> bool:
         host = (host or os.environ.get("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
         if not host.startswith("http"):
@@ -99,8 +111,11 @@ def make(spec: str = "auto"):
     kind, _, model = spec.partition(":")
     kind = kind.lower()
     if kind == "auto":
-        if OllamaLLM.available():
-            return OllamaLLM()
+        models = OllamaLLM.installed()
+        if models:
+            # Prefer the default model if it is installed, otherwise use the first one there.
+            match = [m for m in models if m.split(":")[0] == DEFAULT_OLLAMA_MODEL]
+            return OllamaLLM((match or models)[0])
         if os.environ.get("ANTHROPIC_API_KEY"):
             return ClaudeLLM()
         return None
