@@ -216,3 +216,116 @@ def test_fetch_flattens_yahoo_columns(monkeypatch, df):
                         types.SimpleNamespace(download=lambda *a, **k: pd.DataFrame()))
     with pytest.raises(ValueError, match="no data"):
         data.fetch("NOPE")
+
+
+# ---- ICT building blocks -----------------------------------------------------------------
+
+from village import ict  # noqa: E402
+
+ICT_KINDS = [k for k in ict.CATALOG]
+
+
+@pytest.fixture
+def intraday():
+    return data.sample(1200, seed=5, freq="15min")
+
+
+@pytest.mark.parametrize("kind", ICT_KINDS)
+def test_ict_indicators_never_look_ahead(kind, intraday):
+    cut = 700
+    full = indicators.compute(intraday, kind, {})
+    future = intraday.copy()
+    future.iloc[cut:, :4] = future.iloc[cut:, :4].to_numpy()[::-1]  # scramble the future
+    changed = indicators.compute(future, kind, {})
+    pd.testing.assert_frame_equal(full.iloc[:cut], changed.iloc[:cut])
+
+
+def candles(rows):
+    df = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+    df["volume"] = 0.0
+    df.index = pd.date_range("2024-01-01", periods=len(df), freq="h")
+    return df
+
+
+def test_fvg_finds_a_bullish_gap_and_drops_it_when_closed_through():
+    df = candles([(10, 11, 9, 10.5), (10.5, 14, 10.4, 13.8), (13.8, 15, 12, 14.5),
+                  (14.5, 14.6, 11.5, 12.5), (12.5, 12.6, 10, 10.2)])
+    g = ict.fvg(df)
+    assert g["bull"].tolist() == [0, 0, 1, 0, 0]
+    assert g["bull_bot"].iloc[2] == 11 and g["bull_top"].iloc[2] == 12   # high[t-2]..low[t]
+    assert g["bull_top"].iloc[3] == 12      # still live while price trades into it
+    assert np.isnan(g["bull_top"].iloc[4])  # closed below the gap: gone
+
+
+def test_sweep_needs_a_wick_through_and_a_close_back_inside():
+    rows = [(10, 10.5, 9.5, 10)] * 3 + [(10, 10.5, 8, 10)] + [(10, 10.5, 9.5, 10)] * 3
+    rows += [(10, 10.2, 7.5, 9)]  # wick below the swing low at 8 and close back above it
+    s = ict.sweep(candles(rows), k=3)
+    assert s["bull"].iloc[-1] == 1 and s["bull"].iloc[:-1].sum() == 0
+
+
+def test_session_uses_new_york_time(intraday):
+    s = ict.session(intraday)
+    # 2024-01-01 07:00 UTC is 02:00 in New York (winter): start of the London kill zone.
+    t = pd.Timestamp("2024-01-01 07:00")
+    assert s.loc[t, "hour"] == 2 and s.loc[t, "london"] == 1
+    ny = intraday.copy()
+    ny.attrs["tz"] = "America/New_York"
+    assert ict.session(ny).loc[t, "ny_am"] == 1
+
+
+def test_within_chains_events_over_time():
+    df = data.sample(400, seed=1)
+    spec = {"indicators": [{"id": "r", "type": "rsi", "period": 2}],
+            "entry_long": [{"left": "r", "op": "<", "right": 10}], "exit_long": []}
+    now = strat.signals(df, spec)["entry_long"]
+    spec["entry_long"][0]["within"] = 5
+    later = strat.signals(df, spec)["entry_long"]
+    assert later.sum() > now.sum() and (later | ~now).all()
+    with pytest.raises(strat.SpecError, match="within"):
+        spec["entry_long"][0]["within"] = 0
+        strat.signals(df, spec)
+
+
+def test_random_ict_specs_run_and_mutation_keeps_flags_exact(intraday):
+    rng = random.Random(4)
+    for style in ("ict_liquidity", "ict_blocks", "ict_time"):
+        for _ in range(4):
+            spec = agents.random_spec(style, rng, intraday=True)
+            backtest.run(intraday, spec)
+            m = agents.mutate(spec, rng)
+            for key in strat.RULE_KEYS:
+                for cond in m.get(key) or []:
+                    if cond["op"] == "==":
+                        assert cond["right"] == 1
+            backtest.run(intraday, m)
+
+
+def test_analyst_finds_the_piece_that_matters():
+    spec = {"entry_long": [{"left": "a", "op": ">", "right": 0},
+                           {"left": "b", "op": ">", "right": 0}], "exit_long": []}
+
+    def score(s):  # only condition "a" carries the edge
+        return 1.0 if any(c["left"] == "a" for c in s["entry_long"]) else 0.0
+
+    rows = agents.Analyst.ablate(spec, score)
+    assert rows[0]["condition"].startswith("a") and rows[0]["impact"] == 1.0
+    assert "ESSENTIAL" in agents.Analyst.summarise("x", 1.0, rows)
+
+
+def test_ict_team_runs_end_to_end(tmp_path, intraday):
+    board = Board(tmp_path / "v.db")
+    v = Village(intraday, "fx", board, llm=None, quants=agents.TEAMS["ict"], seed=1,
+                mission=agents.ICT_MISSION, log=lambda *_: None)
+    report = v.run(rounds=3, report_dir=str(tmp_path / "r"))
+    assert {r["author"] for r in board.all_strategies("fx")} >= {"Ivy the liquidity hunter"}
+    assert report.exists()
+    board.close()
+
+
+def test_short_noisy_vault_is_flagged_as_possible_luck():
+    from village.village import verdict
+    train = {"sharpe": 1.0}
+    assert verdict(train, {"sharpe": 0.9, "trades": 30, "t_stat": 3.0}) == "held up"
+    assert verdict(train, {"sharpe": 0.9, "trades": 30, "t_stat": 1.1}) == "held up, but could be luck"
+    assert backtest.luck_bar(1000) > backtest.luck_bar(10)

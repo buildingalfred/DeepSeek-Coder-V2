@@ -14,8 +14,11 @@ _ALIASES = {
 _TIME_NAMES = ("date", "datetime", "time", "timestamp", "open_time", "index")
 
 
-def load_csv(path: str | Path) -> pd.DataFrame:
-    """Read a CSV with a date/time column and open, high, low, close (volume optional)."""
+def load_csv(path: str | Path, tz: str = "UTC") -> pd.DataFrame:
+    """Read a CSV with a date/time column and open, high, low, close (volume optional).
+
+    tz is the timezone the CSV's times are written in (used by the ICT session indicators).
+    Times that carry their own offset are converted to UTC instead."""
     df = pd.read_csv(path)
     df.columns = [_ALIASES.get(c.strip().lower(), c.strip().lower()) for c in df.columns]
     time_col = next((c for c in _TIME_NAMES if c in df.columns), None)
@@ -25,7 +28,12 @@ def load_csv(path: str | Path) -> pd.DataFrame:
             unit = "ms" if ts.iloc[0] > 1e11 else "s"
             df.index = pd.to_datetime(ts, unit=unit)
         else:
-            df.index = pd.to_datetime(ts, utc=True).dt.tz_localize(None)
+            parsed = pd.to_datetime(ts, utc=False, format="mixed")
+            if getattr(parsed.dt, "tz", None) is not None:
+                df.index = parsed.dt.tz_convert("UTC").dt.tz_localize(None)
+                tz = "UTC"
+            else:
+                df.index = parsed
         df = df.drop(columns=[time_col])
     if "close" not in df.columns and "adj_close" in df.columns:
         df["close"] = df["adj_close"]
@@ -38,6 +46,7 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     df = df[~df.index.duplicated()].sort_index()
     if len(df) < 200:
         raise ValueError(f"{path}: only {len(df)} rows; need at least 200 bars to backtest")
+    df.attrs["tz"] = tz
     return df
 
 
@@ -54,11 +63,12 @@ def fetch(symbol: str, period: str = "max", interval: str = "1d") -> pd.DataFram
     raw.columns = [str(c).lower() for c in raw.columns]
     df = raw[[c for c in PRICE_COLUMNS if c in raw.columns]].dropna(subset=["close"])
     if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
+        df.index = df.index.tz_convert("UTC").tz_localize(None)
+    df.attrs["tz"] = "UTC"
     return df
 
 
-def sample(n: int = 3000, seed: int = 7) -> pd.DataFrame:
+def sample(n: int = 3000, seed: int = 7, freq: str = "B") -> pd.DataFrame:
     """Synthetic daily prices with trending and choppy regimes. Good for testing, not for profit."""
     rng = np.random.default_rng(seed)
     regime_len = rng.integers(60, 250, size=n // 60 + 1)
@@ -75,15 +85,34 @@ def sample(n: int = 3000, seed: int = 7) -> pd.DataFrame:
     high = np.maximum(open_, close) + spread
     low = np.minimum(open_, close) - spread
     volume = rng.integers(1_000, 10_000, size=n).astype(float)
-    idx = pd.bdate_range("2012-01-02", periods=n)
-    return pd.DataFrame({"open": open_, "high": high, "low": low, "close": close,
-                         "volume": volume}, index=idx)
+    idx = (pd.bdate_range("2012-01-02", periods=n) if freq == "B"
+           else pd.date_range("2024-01-01", periods=n, freq=freq))
+    df = pd.DataFrame({"open": open_, "high": high, "low": low, "close": close,
+                       "volume": volume}, index=idx)
+    df.attrs["tz"] = "UTC"
+    return df
+
+
+def bar_size(df: pd.DataFrame) -> str:
+    """Typical bar length as text, e.g. '15min', '1h', '1d'."""
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df) < 3:
+        return "unknown"
+    sec = float(pd.Series(df.index).diff().dt.total_seconds().median())
+    for size, label in ((86400 * 7, "1w"), (86400, "1d"), (3600, "h"), (60, "min")):
+        if sec >= size * 0.9:
+            return label if size >= 86400 else f"{round(sec / size):g}{label}"
+    return f"{sec:g}s"
 
 
 def summary(df: pd.DataFrame, name: str = "data") -> str:
     """Short description the agents get so they know what market they are looking at."""
     rets = df["close"].pct_change().dropna()
     span = f"{df.index[0]} -> {df.index[-1]}" if isinstance(df.index, pd.DatetimeIndex) else ""
-    return (f"{name}: {len(df)} bars {span}. First close {df['close'].iloc[0]:.4g}, "
+    size = bar_size(df)
+    note = "" if size in ("unknown", "1d", "1w") or size.endswith("s") else \
+        f" Times are {df.attrs.get('tz', 'UTC')}; session indicators convert to New York time."
+    if size in ("1d", "1w"):
+        note = " Daily or weekly bars: kill-zone/session indicators are meaningless here."
+    return (f"{name}: {len(df)} bars of {size} {span}.{note} First close {df['close'].iloc[0]:.4g}, "
             f"last close {df['close'].iloc[-1]:.4g}, "
             f"mean bar return {rets.mean() * 100:.3f}%, bar volatility {rets.std() * 100:.3f}%.")

@@ -7,7 +7,8 @@ from pathlib import Path
 
 from . import backtest, data, report
 from . import strategy as strat
-from .agents import Critic, Librarian, Mayor, Quant, Tuner, compact, leaderboard_text
+from .agents import (Analyst, Critic, Librarian, Mayor, Quant, Tuner, base_name, compact,
+                     leaderboard_text)
 from .board import Board
 
 MAX_ATTEMPTS_LLM = 3        # an LLM quant gets this many tries to produce a valid, new strategy
@@ -26,7 +27,7 @@ def fingerprint(spec: dict) -> str:
 
 class Village:
     def __init__(self, markets, dataset: str, board: Board, llm=None, quants=None, fee_bps=5.0,
-                 train_frac=0.7, seed=None, tuner=True, log=print):
+                 train_frac=0.7, seed=None, tuner=True, mission: str = "", log=print):
         self.markets = markets if isinstance(markets, dict) else {dataset: markets}
         self.dataset = dataset
         self.board = board
@@ -34,19 +35,25 @@ class Village:
         self.fee_bps = fee_bps
         self.train_frac = train_frac
         self.log = log
+        self.mission = mission
         rng = random.Random(seed)
-        self.librarian = Librarian("Lena the Librarian", llm, log)
+        intraday = any(data.bar_size(df) not in ("1d", "1w", "unknown") for df in self.markets.values())
+        self.librarian = Librarian("Lena the Librarian", llm, log, mission)
+        self.analyst = Analyst("Ada the Analyst", None, log)
         self.critic = Critic("Carl the Critic", llm, log)
         self.mayor = Mayor("Maya the Mayor", llm, log)
         self.tuner = Tuner("Tess the Tuner", None, log, random.Random(rng.random())) if tuner else None
         styles = quants or ["trend", "reversion", "breakout"]
-        names = {"trend": "Tom", "reversion": "Rita", "breakout": "Bo"}
+        names = {"trend": "Tom the trend quant", "reversion": "Rita the reversion quant",
+                 "breakout": "Bo the breakout quant", "ict_liquidity": "Ivy the liquidity hunter",
+                 "ict_blocks": "Ian the order-block hunter", "ict_time": "Iris the time hunter"}
         self.quants = []
         for i, s in enumerate(styles):
-            name = f"{names.get(s, s.title())} the {s} quant"
+            name = names.get(s, f"{s.title()} the quant")
             if styles[:i].count(s):
                 name += f" {styles[:i].count(s) + 1}"
-            self.quants.append(Quant(name, s, llm, log, random.Random(rng.random())))
+            self.quants.append(Quant(name, s, llm, log, random.Random(rng.random()), mission,
+                                     intraday))
         # Agents only ever see the train period; the rest stays sealed in the vault.
         self.data_summary = "\n".join(
             data.summary(df.iloc[: int(len(df) * train_frac)], f"{name} (train period only)")
@@ -73,8 +80,10 @@ class Village:
                 self._turn(quant, r)
             if self.tuner:
                 self._tune(r)
+            analysis = self._analyse(r)
             critique = self.critic.review(self.board.in_round(self.dataset, r),
-                                          leaderboard_text(self.board.leaderboard(self.dataset, 5)))
+                                          leaderboard_text(self.board.leaderboard(self.dataset, 5))
+                                          + (f"\n\nAnalyst:\n{analysis}" if analysis else ""))
             self.board.post(r, self.critic.name, "critique", critique, self.dataset)
             self.log(f"  [{self.critic.name}]\n" + _indent(critique))
         return self.report(report_dir)
@@ -86,11 +95,13 @@ class Village:
             result = f"ERROR: {row['error']}" if row["error"] else str(row["train"])
             mine.append(f"- {compact(row['spec'])}\n  -> {result}")
         critiques = self.board.notes("critique", 1, self.dataset)
+        analyses = self.board.notes("analysis", 1, self.dataset)
         return {
             "data_summary": self.data_summary,
             "ideas": "\n".join(f"- {n['content']}" for n in self.board.notes("idea", 15)),
             "leaderboard": leaderboard_text(top),
             "critique": critiques[-1]["content"] if critiques else "",
+            "analysis": analyses[-1]["content"] if analyses else "",
             "mine": "\n".join(mine),
             "best_specs": [row["spec"] for row in top],
         }
@@ -152,6 +163,34 @@ class Village:
         spec, evaluation = best
         self._record(round_, self.tuner.name, spec, evaluation)
 
+    def _analyse(self, round_: int) -> str:
+        """Ada takes the current leader apart and posts which conditions carry the edge."""
+        top = self.board.leaderboard(self.dataset, 1)
+        if not top or top[0]["score"] <= -99:
+            return ""
+        leader = top[0]
+        last = self.board.notes("analysis", 1, self.dataset)
+        tag = f"#{leader['id']}"
+        if last and last[-1]["content"].startswith(tag):
+            return last[-1]["content"]  # same leader as last round, nothing new to learn
+        rows = self.analyst.ablate(leader["spec"], self._ablation_score)
+        text = f"{tag} " + self.analyst.summarise(leader["name"], leader["score"], rows)
+        self.board.post(round_, self.analyst.name, "analysis", text, self.dataset)
+        self.board.post(round_, self.analyst.name, "trials", str(len(rows)), self.dataset)
+        self.log(f"  [{self.analyst.name}]\n" + _indent(text))
+        # If dropping a piece clearly helps, submit the simpler version for the team to build on.
+        worst = rows[-1] if rows else None
+        if worst and worst["impact"] < -0.05 and fingerprint(worst["variant"]) not in self.seen:
+            spec = dict(worst["variant"], name=f"{base_name(leader['name'])} (simplified)")
+            self._record(round_, self.analyst.name, spec, self.evaluate(spec))
+        return text
+
+    def _ablation_score(self, spec: dict):
+        try:
+            return self.score(self.evaluate(spec))
+        except strat.SpecError:
+            return None
+
     def _tuner_eval(self, spec: dict):
         if fingerprint(spec) in self.seen:
             return None
@@ -169,22 +208,28 @@ class Village:
         table = "\n".join(
             f"{i}. '{r['name']}' ({strat.describe(r['spec'])})\n   train: {r['train']}\n"
             f"   test: {r['test']}\n   verdict: {r['verdict']}" for i, r in enumerate(rows, 1))
-        story = self.mayor.summarise(table) if rows else None
+        analyses = self.board.notes("analysis", 1, self.dataset)
+        analysis = analyses[-1]["content"] if analyses else ""
+        if analysis:
+            table += f"\n\nAnalyst's breakdown of the leader:\n{analysis}"
+        story = self.mayor.summarise(table, self.mission) if rows else None
+        # Only a strategy that survived the vault can be the best candidate; never fall back.
         held = [r for r in rows if r["verdict"] == "held up"]
-        positive = [r for r in rows if r["train"]["sharpe"] > 0]
-        best = held[0] if held else (positive[0] if positive else None)
+        maybe = [r for r in rows if r["verdict"].startswith("held up")]
+        best = held[0] if held else (maybe[0] if maybe else None)
         brain = self.llm.name if self.llm else "none (heuristic)"
 
         out = Path(report_dir)
         out.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        md = report.markdown(self.dataset, rows, best, story, trials, brain, self.fee_bps)
+        md = report.markdown(self.dataset, rows, best, story, trials, brain, self.fee_bps, analysis)
         path = out / f"report-{stamp}.md"
         path.write_text(md, encoding="utf-8")
         charts = [(r, self._curves(r["spec"])) for r in (rows[:3] if rows else [])]
         html_path = out / f"report-{stamp}.html"
         html_path.write_text(report.html(self.dataset, rows, best, story, trials, brain,
-                                         self.fee_bps, charts, self.train_frac), encoding="utf-8")
+                                         self.fee_bps, charts, self.train_frac, analysis),
+                             encoding="utf-8")
         if best:
             (out / "best_strategy.json").write_text(json.dumps(best["spec"], indent=2), "utf-8")
         self.log(f"\nReport written to {html_path} (open it in a browser) and {path}")
@@ -211,6 +256,8 @@ def verdict(train: dict, test: dict) -> str:
         return "failed in vault"
     if test["sharpe"] < 0.5 * train["sharpe"]:
         return "weaker out of sample"
+    if test.get("t_stat", 99) < 2:
+        return "held up, but could be luck"
     return "held up"
 
 

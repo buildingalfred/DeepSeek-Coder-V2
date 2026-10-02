@@ -14,7 +14,7 @@ import json
 import random
 import re
 
-from . import indicators, pdfs
+from . import ict, indicators, pdfs
 from . import strategy as strat
 from .llm import LLMError
 
@@ -30,11 +30,16 @@ SPEC_GUIDE = f"""A strategy is a JSON object:
   "stop_loss_pct": number or null,   // e.g. 5 means exit after a 5% loss
   "take_profit_pct": number or null
 }}
-A condition is {{"left": X, "op": OP, "right": Y}} where OP is one of {strat.OPS}.
+A condition is {{"left": X, "op": OP, "right": Y}} or {{"left": X, "op": OP, "right": Y, "within": N}}
+where OP is one of {strat.OPS}.
 X is a price column ({", ".join(strat.PRICE_COLUMNS)}), an indicator id, or "<id>.<output>" for
-indicators with several outputs. Y is the same kind of name, or a number.
+indicators with several outputs. Y is the same kind of name, or a number. "within": N makes the
+condition true if it held on any of the last N bars, so conditions can form a sequence.
 Indicators available:
 {indicators.catalog_text()}
+
+{ict.GUIDE}
+
 Signals are checked at each bar's close and filled at the next bar's open. Fees are charged."""
 
 
@@ -79,9 +84,19 @@ class Agent:
 
 class Librarian(Agent):
     role = "librarian"
-    SYSTEM = ("You are the Librarian of a village of trading researchers. You read papers, books and "
-              "notes and extract concrete, testable trading ideas. Only report ideas that could be "
-              "expressed with standard technical indicators on OHLCV price data. Be concise.")
+    SYSTEM = ("You are the Librarian of a village of trading researchers. You read papers, bank and "
+              "central-bank research, books and notes, and extract concrete, testable rules about "
+              "how price moves: exact conditions, sequences of events, times of day (say which "
+              "time zone), price levels, thresholds and parameters. Look closely for details that "
+              "are easy to miss: footnotes, tables, timing of fixes and auctions, liquidity and "
+              "order-flow behaviour, stop clusters, session opens. Say which building block each "
+              "idea maps to (e.g. liquidity sweep, fair value gap, order block, market structure "
+              "shift, kill zone, previous-day high/low, moving average, RSI). Only report ideas "
+              "that can be tested on OHLCV price data. Be concise and precise.")
+
+    def __init__(self, name, llm=None, log=print, mission: str = ""):
+        super().__init__(name, llm, log)
+        self.mission = mission
 
     def study(self, folder, board, round_: int, max_chunks: int = 6) -> int:
         """Read every document not read before and post its ideas. Returns number of new ideas."""
@@ -108,7 +123,8 @@ class Librarian(Agent):
         return found
 
     def _ideas_from(self, piece: str, source: str) -> list[str]:
-        reply = self.ask(self.SYSTEM,
+        system = self.SYSTEM + (f"\n\nThe village's mission: {self.mission}" if self.mission else "")
+        reply = self.ask(system,
                          f"Text from '{source}':\n\n{piece}\n\nReturn JSON: "
                          '{"ideas": ["idea with concrete rule and parameters", ...]} '
                          "(at most 5, empty list if none).", json_mode=True)
@@ -135,6 +151,20 @@ class Librarian(Agent):
             "breakout": "price breakouts",
             "volatility": "volatility filters (ATR)",
             "stochastic": "stochastic oscillator",
+            "fair value gap": "fair value gaps (imbalances)",
+            "imbalance": "fair value gaps (imbalances)",
+            "order block": "order blocks",
+            "liquidity": "liquidity pools and sweeps",
+            "stop hunt": "liquidity sweeps (stop hunts)",
+            "kill zone": "ICT kill zones (session timing)",
+            "killzone": "ICT kill zones (session timing)",
+            "london open": "session timing (London open)",
+            "market structure": "market structure shifts",
+            "displacement": "displacement candles",
+            "premium": "premium/discount of the dealing range",
+            "optimal trade entry": "OTE retracement (62-79%)",
+            "silver bullet": "silver bullet window (10-11 New York)",
+            "fix": "timing around benchmark fixes",
         }
         found = sorted({v for k, v in hits.items() if k in lower})
         return [f"mentions {', '.join(found)}"] if found else []
@@ -144,24 +174,47 @@ STYLES = {
     "trend": "trend follower: you believe prices that move keep moving. Crossovers, MACD, momentum.",
     "reversion": "mean-reversion trader: you fade extremes. RSI, z-score, Bollinger bands.",
     "breakout": "breakout and volatility trader: you buy strength escaping a range, with stops.",
+    "ict_liquidity": ("ICT liquidity specialist: price seeks liquidity. You chain sequences: a "
+                      "sweep of a swing low/high, then a market structure shift, then entry on the "
+                      "retrace into the fair value gap left by the displacement."),
+    "ict_blocks": ("ICT order-block specialist: you buy bullish order blocks in discount and sell "
+                   "bearish ones in premium, using the dealing range and the OTE retracement."),
+    "ict_time": ("ICT time-and-price specialist: you believe the algorithm runs on a clock. You "
+                 "use kill zones (London, New York AM, silver bullet) and raids on the previous "
+                 "day's high/low."),
 }
+TEAMS = {
+    "default": ["trend", "reversion", "breakout"],
+    "ict": ["ict_liquidity", "ict_blocks", "ict_time"],
+    "mixed": ["ict_liquidity", "ict_blocks", "ict_time", "trend", "reversion"],
+}
+ICT_MISSION = ("Find out whether ICT's model of price delivery holds up: test liquidity sweeps, "
+               "market structure shifts, fair value gaps, order blocks, premium/discount and "
+               "kill zones, and above all how they connect into one sequence. Work as a team: "
+               "build on whatever piece the analyst shows is actually adding value, and drop "
+               "pieces that add nothing.")
 
 
 class Quant(Agent):
     role = "quant"
 
-    def __init__(self, name, style, llm=None, log=print, rng=None):
+    def __init__(self, name, style, llm=None, log=print, rng=None, mission: str = "",
+                 intraday: bool = False):
         super().__init__(name, llm, log)
         self.style = style
         self.rng = rng or random.Random()
+        self.mission = mission
+        self.intraday = intraday
 
     def system_prompt(self) -> str:
-        return (f"You are {self.name}, a quant in a village of trading researchers. You are a "
-                f"{STYLES[self.style]} You work with others: build on good ideas on the board, "
+        mission = f"The village's mission: {self.mission}\n" if self.mission else ""
+        return (f"You are {self.name}, a quant in a village of trading researchers. {mission}You are "
+                f"a {STYLES[self.style]} You work with others: build on good ideas on the board, "
                 "learn from the critic, avoid repeating failures, and keep strategies simple "
                 "(few rules generalise better; 20+ trades are needed to trust a result). The "
                 "leaderboard ranks by 'robust' Sharpe: the strategy must work in every slice of "
-                "history and every market, not just one lucky stretch.\n\n"
+                "history and every market, not just one lucky stretch. Short or noisy data makes big "
+                "Sharpe ratios easy to get by luck; the t-stat says how solid a result is.\n\n"
                 + SPEC_GUIDE + "\n\nReply with ONLY the JSON strategy object.")
 
     def propose(self, ctx: dict, error: str | None = None, previous: str | None = None) -> dict:
@@ -169,6 +222,8 @@ class Quant(Agent):
                   f"Ideas from the library:\n{ctx['ideas'] or '(none)'}\n\n"
                   f"Leaderboard (train period):\n{ctx['leaderboard']}\n\n"
                   f"Critic's latest notes:\n{ctx['critique'] or '(none yet)'}\n\n"
+                  f"Analyst's findings (which pieces of the leaders matter):\n"
+                  f"{ctx.get('analysis') or '(none yet)'}\n\n"
                   f"Your recent attempts:\n{ctx['mine'] or '(none)'}\n\n"
                   "Propose ONE new strategy that you think will beat the leaderboard.")
         if error:
@@ -189,7 +244,54 @@ class Quant(Agent):
             spec = mutate(self.rng.choice(best_specs[:3]), self.rng)
             spec["name"] = f"{base_name(spec.get('name', 'leader'))} (tweaked by {self.name.split()[0]})"
             return spec
-        return random_spec(self.style, self.rng, self.name)
+        return random_spec(self.style, self.rng, self.name, intraday=self.intraday)
+
+
+class Analyst(Agent):
+    """Takes the leading strategy apart: removes one condition at a time and measures the damage.
+    This shows which pieces of a setup actually carry the edge. No LLM needed."""
+    role = "analyst"
+
+    @staticmethod
+    def ablate(spec: dict, evaluate) -> list[dict]:
+        """evaluate(spec) -> score or None. Returns one row per condition, most important first."""
+        base = evaluate(spec)
+        if base is None:
+            return []
+        rows = []
+        for key in strat.RULE_KEYS:
+            conds = spec.get(key) or []
+            for i, cond in enumerate(conds):
+                if key.startswith("entry") and len(conds) == 1:
+                    continue  # removing the only entry rule leaves nothing to test
+                variant = copy.deepcopy(spec)
+                variant[key] = conds[:i] + conds[i + 1:]
+                score = evaluate(variant)
+                if score is None:
+                    continue
+                rows.append({"rule": key, "condition": _cond_text(cond), "without": score,
+                             "impact": round(base - score, 3), "variant": variant})
+        return sorted(rows, key=lambda r: -r["impact"])
+
+    @staticmethod
+    def summarise(name: str, base: float, rows: list[dict]) -> str:
+        if not rows:
+            return f"'{name}' has no condition that can be removed for testing."
+        lines = [f"Pieces of '{name}' (robust score {base}):"]
+        for r in rows:
+            if r["impact"] > 0.05:
+                verdict = "ESSENTIAL" if r["impact"] > 0.2 else "helps"
+            elif r["impact"] < -0.05:
+                verdict = "HURTS, drop it"
+            else:
+                verdict = "adds nothing"
+            lines.append(f"- {r['rule']}: {r['condition']} -> without it {r['without']} "
+                         f"({verdict})")
+        return "\n".join(lines)
+
+
+def _cond_text(c: dict) -> str:
+    return f"{c['left']} {c['op']} {c['right']}" + (f" within {c['within']}" if c.get("within") else "")
 
 
 class Tuner(Agent):
@@ -222,6 +324,7 @@ class Tuner(Agent):
 class Critic(Agent):
     role = "critic"
     SYSTEM = ("You are the Critic of a village of trading researchers. You review backtests "
+              "(including any trading theory the village is testing, such as ICT) "
               "skeptically: overfitting, too few trades, drawdowns, not beating buy & hold, rules "
               "that only work by luck. Give short, concrete advice the quants can act on next round.")
 
@@ -268,8 +371,10 @@ class Mayor(Agent):
               "fails on the unseen test period is probably overfit, and past results do not "
               "guarantee future returns.")
 
-    def summarise(self, table: str) -> str | None:
-        return self.ask(self.SYSTEM,
+    def summarise(self, table: str, mission: str = "") -> str | None:
+        system = self.SYSTEM + (f" The village's mission was: {mission} Say plainly what the "
+                                "evidence says about it." if mission else "")
+        return self.ask(system,
                         f"Top strategies. 'train' is what the villagers optimised on; 'test' is the "
                         f"sealed later period nobody saw:\n\n{table}\n\nWrite a short report (under "
                         "300 words): what worked, what is likely overfit, what to try next.")
@@ -277,7 +382,9 @@ class Mayor(Agent):
 
 # ---- random strategy generation and mutation (the no-LLM villagers) ---------------------
 
-def random_spec(style: str, rng: random.Random, author: str = "") -> dict:
+def random_spec(style: str, rng: random.Random, author: str = "", intraday: bool = False) -> dict:
+    if style.startswith("ict"):
+        return random_ict_spec(style, rng, intraday)
     stop = rng.choice([None, 3, 5, 8, 12])
     if style == "trend":
         kind = rng.choice(["ema", "sma"])
@@ -340,12 +447,59 @@ def random_spec(style: str, rng: random.Random, author: str = "") -> dict:
     return spec
 
 
+def random_ict_spec(style: str, rng: random.Random, intraday: bool = False) -> dict:
+    """Random ICT-style sequences, so the village can explore ICT even without an LLM."""
+    k = rng.choice([2, 3, 5])
+    stop = rng.choice([1, 2, 3, 5]) if intraday else rng.choice([3, 5, 8])
+    take = round(stop * rng.choice([1.5, 2, 3]), 1)
+    long_side = rng.random() < 0.6
+    up, side = ("bull", "long") if long_side else ("bear", "short")
+    shift = "mss_up" if long_side else "mss_down"
+    inds = [{"id": "sw", "type": "sweep", "k": k}, {"id": "st", "type": "structure", "k": k}]
+    if style == "ict_liquidity":
+        inds.append({"id": "gap", "type": "fvg", "min_atr": rng.choice([0.0, 0.25, 0.5])})
+        entry = [{"left": "sw." + up, "op": "==", "right": 1, "within": rng.choice([10, 20, 40])},
+                 {"left": "st." + shift, "op": "==", "right": 1, "within": rng.choice([5, 10, 20])},
+                 ({"left": "low", "op": "<=", "right": "gap.bull_top"} if long_side
+                  else {"left": "high", "op": ">=", "right": "gap.bear_bot"})]
+        name = f"sweep -> MSS -> FVG {side}"
+    elif style == "ict_blocks":
+        inds += [{"id": "ob", "type": "order_block", "k": k, "lookback": rng.choice([5, 10, 20])},
+                 {"id": "pd", "type": "premium_discount", "k": k}]
+        entry = ([{"left": "low", "op": "<=", "right": "ob.bull_top"},
+                  {"left": "pd.pos", "op": "<", "right": rng.choice([0.4, 0.5])}] if long_side else
+                 [{"left": "high", "op": ">=", "right": "ob.bear_bot"},
+                  {"left": "pd.pos", "op": ">", "right": rng.choice([0.5, 0.6])}])
+        if rng.random() < 0.5:
+            entry.append({"left": "st." + shift, "op": "==", "right": 1, "within": rng.choice([10, 30])})
+        name = f"order block in {'discount' if long_side else 'premium'} {side}"
+    else:
+        inds.append({"id": "pdl", "type": "prev_day"})
+        entry = [({"left": "low", "op": "<", "right": "pdl.low"} if long_side
+                  else {"left": "high", "op": ">", "right": "pdl.high"}),
+                 {"left": "st." + shift, "op": "==", "right": 1, "within": rng.choice([3, 6, 12])}]
+        name = f"previous-day raid + MSS {side}"
+        if intraday:
+            inds.append({"id": "t", "type": "session"})
+            zone = rng.choice(["london", "ny_am", "silver_bullet"])
+            entry.append({"left": "t." + zone, "op": "==", "right": 1})
+            name += f" in {zone}"
+    spec = {"name": name, "idea": "ICT sequence generated by the village's random search",
+            "indicators": inds, "entry_long": [], "exit_long": [], "entry_short": [],
+            "exit_short": [], "stop_loss_pct": stop, "take_profit_pct": take}
+    spec["entry_" + side] = entry
+    # Exit on a shift the other way, if stop or target did not hit first.
+    other = "mss_down" if long_side else "mss_up"
+    spec["exit_" + side] = [{"left": "st." + other, "op": "==", "right": 1}]
+    return spec
+
+
 def mutate(spec: dict, rng: random.Random) -> dict:
     """Jitter the numbers in a spec by up to about 25%."""
     spec = copy.deepcopy(spec)
     for ind in spec.get("indicators", []):
         for k, v in list(ind.items()):
-            if k in ("id", "type", "source") or not isinstance(v, (int, float)):
+            if k in ("id", "type", "source") or not isinstance(v, (int, float)) or v == 0:
                 continue
             if isinstance(v, int):
                 ind[k] = max(2, int(round(v * rng.uniform(0.75, 1.25))))
@@ -353,14 +507,20 @@ def mutate(spec: dict, rng: random.Random) -> dict:
                 ind[k] = round(max(0.1, v * rng.uniform(0.8, 1.2)), 2)
     for key in strat.RULE_KEYS:
         for cond in spec.get(key) or []:
-            if isinstance(cond.get("right"), (int, float)) and cond["right"] != 0:
+            # Flag checks ("== 1") must stay exact; thresholds can move.
+            if (isinstance(cond.get("right"), (int, float)) and cond["right"] != 0
+                    and cond.get("op") != "=="):
                 cond["right"] = round(cond["right"] * rng.uniform(0.85, 1.15), 2)
-    if spec.get("stop_loss_pct") and rng.random() < 0.5:
-        spec["stop_loss_pct"] = round(spec["stop_loss_pct"] * rng.uniform(0.7, 1.3), 1)
+            if cond.get("within"):
+                cond["within"] = max(1, min(strat.MAX_WITHIN,
+                                            int(round(cond["within"] * rng.uniform(0.7, 1.3)))))
+    for key in ("stop_loss_pct", "take_profit_pct"):
+        if spec.get(key) and rng.random() < 0.5:
+            spec[key] = round(spec[key] * rng.uniform(0.7, 1.3), 1)
     return spec
 
 
-_SUFFIX = re.compile(r"\s*\((tuned|tweaked by [^)]*)\)\s*$")
+_SUFFIX = re.compile(r"\s*\((tuned|simplified|tweaked by [^)]*)\)\s*$")
 
 
 def base_name(name: str) -> str:

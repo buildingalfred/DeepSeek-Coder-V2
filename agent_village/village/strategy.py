@@ -21,7 +21,9 @@ Example spec:
   "take_profit_pct": null
 }
 
-Conditions inside one list are combined with AND. "left"/"right" may be a price column
+Conditions inside one list are combined with AND. Add "within": N to a condition to make it true
+when it held on any of the last N bars, which chains steps into a sequence (sweep, then shift,
+then retrace). "left"/"right" may be a price column
 (open, high, low, close, volume), an indicator id, "<id>.<output>" for multi-output indicators
 (e.g. "bb.upper", "m.hist"), or (right only) a number.
 """
@@ -35,7 +37,8 @@ import pandas as pd
 from . import indicators
 
 PRICE_COLUMNS = ["open", "high", "low", "close", "volume"]
-OPS = [">", "<", ">=", "<=", "crosses_above", "crosses_below"]
+OPS = [">", "<", ">=", "<=", "==", "crosses_above", "crosses_below"]
+MAX_WITHIN = 500
 RULE_KEYS = ["entry_long", "exit_long", "entry_short", "exit_short"]
 _ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -91,6 +94,10 @@ def _check_condition(cond, cols: pd.DataFrame, key: str) -> None:
         raise SpecError(f"{key}: unknown op '{op}'. Use one of {OPS}")
     if not isinstance(right, (int, float)) and right not in cols.columns:
         raise SpecError(f"{key}: right must be a number or one of: {available} (got {right!r})")
+    within = cond.get("within")
+    if within is not None and (not isinstance(within, int) or isinstance(within, bool)
+                               or not 1 <= within <= MAX_WITHIN):
+        raise SpecError(f"{key}: 'within' must be a whole number of bars from 1 to {MAX_WITHIN}")
 
 
 def _condition_mask(cond: dict, cols: pd.DataFrame) -> np.ndarray:
@@ -106,11 +113,18 @@ def _condition_mask(cond: dict, cols: pd.DataFrame) -> np.ndarray:
         m = left >= right
     elif op == "<=":
         m = left <= right
+    elif op == "==":
+        m = left == right
     elif op == "crosses_above":
         m = (left > right) & (left.shift() <= right.shift())
     else:
         m = (left < right) & (left.shift() >= right.shift())
-    return m.fillna(False).to_numpy(dtype=bool)
+    m = m.fillna(False).astype(bool)
+    within = cond.get("within")
+    if within and within > 1:
+        # True if the condition held on any of the last `within` bars (including this one).
+        m = m.astype(float).rolling(within, min_periods=1).max().astype(bool)
+    return m.to_numpy(dtype=bool)
 
 
 def signals(df: pd.DataFrame, spec: dict) -> dict:
@@ -159,7 +173,9 @@ def extract_json(text: str):
 def describe(spec: dict) -> str:
     """One-line human summary of a spec."""
     def rules(key):
-        return " AND ".join(f"{c['left']} {c['op']} {c['right']}" for c in spec.get(key) or [])
+        return " AND ".join(
+            f"{c['left']} {c['op']} {c['right']}" + (f" within {c['within']}" if c.get("within") else "")
+            for c in spec.get(key) or [])
 
     parts = []
     for key in RULE_KEYS:

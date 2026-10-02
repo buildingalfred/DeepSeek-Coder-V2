@@ -101,27 +101,30 @@ def metrics(rets, pos, buy_hold, trades, lo, hi, bpy) -> dict:
     if len(rets) == 0:
         return {}
     eq = np.cumprod(1 + rets)
-    total = eq[-1] - 1
+    total = float(eq[-1] - 1)
     years = len(rets) / bpy
     cagr = eq[-1] ** (1 / years) - 1 if years > 0 and eq[-1] > 0 else -1.0
     std = rets.std()
     sharpe = rets.mean() / std * np.sqrt(bpy) if std > 0 else 0.0
     peak = np.maximum.accumulate(eq)
-    max_dd = (eq / peak - 1).min()
+    max_dd = float((eq / peak - 1).min())
     mine = [t for t in trades if lo <= t["entry_i"] < hi]
     wins = [t["pnl_pct"] for t in mine if t["pnl_pct"] > 0]
     losses = [t["pnl_pct"] for t in mine if t["pnl_pct"] <= 0]
     pf = sum(wins) / -sum(losses) if losses and sum(losses) < 0 else (float("inf") if wins else 0.0)
     return {
         "total_return_pct": round(total * 100, 2),
-        "cagr_pct": round(cagr * 100, 2),
+        "cagr_pct": round(float(cagr) * 100, 2),
         "sharpe": round(float(sharpe), 3),
+        # Sharpe x sqrt(years): how many standard errors from zero. Around 2+ is hard to get by luck
+        # for ONE strategy; picking the best of many needs more (see luck_bar).
+        "t_stat": round(float(sharpe) * float(np.sqrt(max(years, 1e-9))), 2),
         "max_drawdown_pct": round(max_dd * 100, 2),
         "trades": len(mine),
         "win_rate_pct": round(100 * len(wins) / len(mine), 1) if mine else 0.0,
-        "profit_factor": round(pf, 2) if np.isfinite(pf) else 999.0,
+        "profit_factor": round(float(pf), 2) if np.isfinite(pf) else 999.0,
         "exposure_pct": round(100 * float(np.mean(pos != 0)), 1),
-        "buy_hold_pct": round((np.prod(1 + buy_hold) - 1) * 100, 2),
+        "buy_hold_pct": round(float(np.prod(1 + buy_hold) - 1) * 100, 2),
     }
 
 
@@ -174,6 +177,11 @@ def combine(ms: list[dict]) -> dict:
     out["trades"] = int(sum(m["trades"] for m in ms))
     out["max_drawdown_pct"] = min(m["max_drawdown_pct"] for m in ms)
     return out
+
+
+def luck_bar(trials: int) -> float:
+    """t-stat the best of `trials` random strategies would reach by pure luck (about sqrt(2 ln N))."""
+    return round(float(np.sqrt(2 * np.log(max(trials, 2)))), 2)
 
 
 MIN_TRADES_PER_MARKET = 10

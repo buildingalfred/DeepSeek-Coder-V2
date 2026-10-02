@@ -7,7 +7,11 @@ import time
 import numpy as np
 
 from . import strategy as strat
+from .backtest import luck_bar
 
+NO_WINNER = ("No strategy in the top 10 held up in the vault yet. That is a real result: on this "
+             "data, nothing the village tried has shown an edge it could keep on unseen prices. "
+             "Run more rounds, add more data (longer history, more markets) or new ideas.")
 DISCLAIMER = "Backtests are not promises. Paper-trade anything before risking money."
 
 
@@ -15,22 +19,27 @@ def _intro(trials: int) -> str:
     return (f"The villagers only saw the **train** period. The **test** (vault) period is later "
             f"data nobody optimised on: it is the honest check. The village has backtested "
             f"**{trials}** strategies on this data. With that many tries, some will look good by "
-            f"pure luck, so trust only strategies that also held up in the vault.")
+            f"pure luck: the best of {trials} random strategies would reach a train t-stat of "
+            f"about {luck_bar(trials)} with no edge at all. Trust only strategies that also held "
+            f"up in the vault with a vault t-stat of 2 or more (\"could be luck\" means the vault "
+            f"was too short or too noisy to tell).")
 
 
 def _cells(i: int, r: dict) -> list[str]:
     tr, te = r["train"], r["test"]
     return [str(i), r["name"], r["author"].split(" the ")[0], str(tr.get("robust_sharpe", "-")),
-            str(tr.get("positive_periods", "-")), str(tr["sharpe"]), f"{tr['total_return_pct']}%",
-            str(te["sharpe"]), f"{te['total_return_pct']}%", str(te["trades"]),
-            f"{te['buy_hold_pct']}%", r["verdict"]]
+            str(tr.get("positive_periods", "-")), str(tr["sharpe"]), str(tr.get("t_stat", "-")),
+            f"{tr['total_return_pct']}%", str(te["sharpe"]), str(te.get("t_stat", "-")),
+            f"{te['total_return_pct']}%", str(te["trades"]), f"{te['buy_hold_pct']}%", r["verdict"]]
 
 
-HEADERS = ["#", "Strategy", "By", "Robust score", "Good periods", "Train Sharpe", "Train return",
-           "Test Sharpe", "Test return", "Test trades", "Test buy&hold", "Verdict"]
+HEADERS = ["#", "Strategy", "By", "Robust score", "Good periods", "Train Sharpe", "Train t",
+           "Train return", "Test Sharpe", "Test t", "Test return", "Test trades", "Test buy&hold",
+           "Verdict"]
+NUMERIC = range(3, 13)
 
 
-def markdown(dataset, rows, best, story, trials, brain, fee_bps) -> str:
+def markdown(dataset, rows, best, story, trials, brain, fee_bps, analysis="") -> str:
     lines = [f"# Village report: {dataset}", "",
              f"{time.strftime('%Y-%m-%d %H:%M')} · brain: {brain} · fees {fee_bps} bps/side", "",
              _intro(trials), "",
@@ -41,8 +50,14 @@ def markdown(dataset, rows, best, story, trials, brain, fee_bps) -> str:
         lines.append("| - | no valid strategies yet |" + " |" * (len(HEADERS) - 2))
     if story:
         lines += ["", "## The Mayor's summary", "", story.strip()]
+    if analysis:
+        lines += ["", "## What carries the edge (Ada the Analyst)", "",
+                  "Each condition of the leader was removed in turn to see how much the score "
+                  "drops. Essential pieces are the real signal; pieces that add nothing are noise.",
+                  "", analysis.split(" ", 1)[1] if analysis.startswith("#") else analysis]
     if best:
-        lines += ["", f"## Best candidate: {best['name']}", "", strat.describe(best["spec"]), ""]
+        lines += ["", f"## Best candidate: {best['name']} ({best['verdict']})", "",
+                  strat.describe(best["spec"]), ""]
         if best.get("markets") and len(best["markets"]) > 1:
             lines += ["| Market | Train Sharpe | Train return | Test Sharpe | Test return |",
                       "|---|---|---|---|---|"]
@@ -51,6 +66,8 @@ def markdown(dataset, rows, best, story, trials, brain, fee_bps) -> str:
                              f"| {m['test']['sharpe']} | {m['test']['total_return_pct']}% |")
             lines.append("")
         lines += ["```json", json.dumps(best["spec"], indent=2), "```"]
+    elif rows:
+        lines += ["", "## Best candidate", "", NO_WINNER]
     lines += ["", f"_{DISCLAIMER}_"]
     return "\n".join(lines) + "\n"
 
@@ -135,7 +152,7 @@ def _e(x) -> str:
 
 
 def _pill(v: str) -> str:
-    cls = "good" if v == "held up" else ("bad" if v in ("failed in vault", "never worked") else "meh")
+    cls = "good" if v == "held up" else "meh" if v.startswith("held up") else ("bad" if v in ("failed in vault", "never worked") else "meh")
     return f'<span class="pill {cls}">{_e(v)}</span>'
 
 
@@ -213,14 +230,15 @@ def _ticks(lo: float, hi: float) -> list[float]:
     return ticks or [1]
 
 
-def html(dataset, rows, best, story, trials, brain, fee_bps, charts, train_frac) -> str:
+def html(dataset, rows, best, story, trials, brain, fee_bps, charts, train_frac,
+         analysis="") -> str:
     intro = _intro(trials).replace("**", "")
-    head = "".join(f'<th class="{"num" if i >= 3 and i <= 10 else ""}">{_e(h)}</th>'
+    head = "".join(f'<th class="{"num" if i in NUMERIC else ""}">{_e(h)}</th>'
                    for i, h in enumerate(HEADERS))
     body = ""
     for i, r in enumerate(rows, 1):
         cells = _cells(i, r)
-        tds = "".join(f'<td class="{"num" if 3 <= j <= 10 else ""}">{_e(c)}</td>'
+        tds = "".join(f'<td class="{"num" if j in NUMERIC else ""}">{_e(c)}</td>'
                       for j, c in enumerate(cells[:-1]))
         body += f"<tr>{tds}<td>{_pill(cells[-1])}</td></tr>"
     if not rows:
@@ -238,6 +256,12 @@ def html(dataset, rows, best, story, trials, brain, fee_bps, charts, train_frac)
            "</table></div>"]
     if story:
         out.append(f"<h2>The Mayor's summary</h2><div class='card story'>{_e(story.strip())}</div>")
+    if analysis:
+        text = analysis.split(" ", 1)[1] if analysis.startswith("#") else analysis
+        out.append("<h2>What carries the edge</h2><p class='meta'>Ada the Analyst removed each "
+                   "condition of the leading strategy in turn. If the score collapses, that piece "
+                   "is the real signal. If nothing changes, it is decoration.</p>"
+                   f"<div class='card story'>{_e(text)}</div>")
     if charts:
         out.append("<h2>Equity curves</h2><p class='meta'>Growth of 1 unit of money (log scale). "
                    "Hover for values. The shaded part is the vault: what happened on data the "
@@ -247,7 +271,7 @@ def html(dataset, rows, best, story, trials, brain, fee_bps, charts, train_frac)
                        f"<p class='rules'>{_e(strat.describe(r['spec']))}</p>"
                        f"{_chart(curves, train_frac)}</div>")
     if best:
-        out.append(f"<h2>Best candidate: {_e(best['name'])}</h2>")
+        out.append(f"<h2>Best candidate: {_e(best['name'])} {_pill(best['verdict'])}</h2>")
         if best.get("markets") and len(best["markets"]) > 1:
             trs = "".join(
                 f"<tr><td>{_e(n)}</td><td class='num'>{m['train']['sharpe']}</td>"
@@ -260,6 +284,8 @@ def html(dataset, rows, best, story, trials, brain, fee_bps, charts, train_frac)
                        "<th class='num'>Test Sharpe</th><th class='num'>Test return</th></tr>"
                        f"</thead><tbody>{trs}</tbody></table></div>")
         out.append(f"<pre>{_e(json.dumps(best['spec'], indent=2))}</pre>")
+    elif rows:
+        out.append(f"<h2>Best candidate</h2><div class='card'>{_e(NO_WINNER)}</div>")
     out.append(f"<footer>{_e(DISCLAIMER)} Not financial advice.</footer></main>"
                f"<script>{JS}</script></body></html>")
     return "\n".join(out)

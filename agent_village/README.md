@@ -108,6 +108,53 @@ Useful options for `run`: `--fee-bps 10` (fees per side; crypto and forex often 
 the default 5), `--quants trend,trend,reversion` (choose who lives in the village), and
 `--train 0.6` (seal a bigger vault), `--no-tuner` (leave Tess out).
 
+## The ICT team: testing the "algorithm"
+
+ICT says price is delivered by an algorithm: it runs to liquidity (stops above highs and below
+lows), leaves imbalances (fair value gaps), shifts structure, and then delivers to the next
+target, on a clock (kill zones). Every part of that claim can be written as an exact rule, so
+the village can test it piece by piece and as a full sequence.
+
+```
+python -m village run --team ict --data data/EURUSD_15m.csv --tz UTC --rounds 20
+```
+
+| Villager | Hunts for |
+|---|---|
+| **Ivy** the liquidity hunter | sweep of a swing high/low → market structure shift → entry on the retrace into the fair value gap |
+| **Ian** the order-block hunter | order blocks in discount (longs) or premium (shorts), OTE retracements |
+| **Iris** the time hunter | kill zones (London, NY AM, silver bullet) and raids on the previous day's high/low |
+| **Ada** the Analyst | takes the leader apart one condition at a time and reports which pieces are ESSENTIAL, which add nothing and which HURT. If dropping a piece helps, she submits the simpler version herself. |
+
+The whole team shares one mission and reads Ada's findings every round, so they converge on the
+pieces that carry the edge and drop the decoration. `--team mixed` adds the trend and reversion
+quants as a control group: if ICT setups cannot beat simple moving averages, that tells you
+something too. `--mission "..."` gives the team your own instructions.
+
+ICT building blocks the agents can use: `sweep`, `structure` (BOS / MSS), `fvg`,
+`order_block`, `swings`, `premium_discount` (with OTE), `displacement`, `session` (kill zones in
+New York time) and `prev_day` (previous day high/low). A condition can carry `"within": N` ("this
+happened in the last N bars"), which is how steps are chained into a sequence:
+
+```json
+"entry_long": [
+  {"left": "sw.bull",   "op": "==", "right": 1, "within": 20},
+  {"left": "st.mss_up", "op": "==", "right": 1, "within": 10},
+  {"left": "low",       "op": "<=", "right": "gap.bull_top"}
+]
+```
+
+Kill zones need **intraday** data and the right time zone: pass `--tz` with the zone your CSV's
+times are in (default UTC). Yahoo only keeps short intraday history
+(`python -m village fetch EURUSD=X --interval 1h --period 2y`); for more, export from your broker
+or TradingView.
+
+**The luck check.** On short intraday samples, big numbers come easily by chance: on two months
+of 15-minute *random* prices, a strategy's Sharpe swings by ±2.4 from luck alone. Every result
+therefore has a **t-stat**, and the report shows the "luck bar": the t-stat the best of all the
+tried strategies would reach with no edge at all. A strategy only counts as a real find when it
+holds up in the vault with a vault t-stat of 2 or more. Otherwise it is marked "could be luck".
+
 ## How strategies look
 
 The agents write strategies as JSON, never as code, so nothing they produce can run on your
@@ -129,8 +176,9 @@ computer. Example:
 }
 ```
 
-The indicators are `sma`, `ema`, `rsi`, `macd`, `bbands`, `atr`, `roc`, `stoch_k` and `zscore`.
-They live in `village/indicators.py`. Add one to `CATALOG` there and the agents can use it.
+The classic indicators are `sma`, `ema`, `rsi`, `macd`, `bbands`, `atr`, `roc`, `stoch_k` and
+`zscore` (in `village/indicators.py`); the ICT ones are in `village/ict.py`. Add one to a
+`CATALOG` there and the agents can use it.
 
 ## Project layout
 
@@ -142,6 +190,7 @@ village/
   backtest.py    the backtester and its metrics
   strategy.py    the strategy JSON format and its validation
   indicators.py  technical indicators
+  ict.py         ICT building blocks (sweeps, FVGs, order blocks, kill zones, ...)
   pdfs.py        reading PDFs and notes
   board.py       shared memory (SQLite)
   llm.py         Ollama / Claude / none
@@ -150,6 +199,8 @@ tests/           run with: python -m pytest
 
 ## A word of honesty
 
-No backtest "cracks" a market. Most strategies that look great on past data fail on new data,
-and the vault exists to show you that early. Treat a strategy that holds up as a candidate for
+No backtest "cracks" a market, and nobody has shown that a single hidden algorithm delivers
+price. What the village can do is turn each claim into a rule and measure it honestly. Most
+strategies that look great on past data fail on new data, and the vault and the luck check exist
+to show you that early. Treat a strategy that holds up as a candidate for
 paper trading, not as a money machine. This is not financial advice.

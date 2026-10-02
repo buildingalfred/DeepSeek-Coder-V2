@@ -3,6 +3,8 @@
 import numpy as np
 import pandas as pd
 
+from . import ict
+
 
 def sma(s: pd.Series, period: int) -> pd.Series:
     return s.rolling(period, min_periods=period).mean()
@@ -75,8 +77,17 @@ CATALOG = {
 
 def compute(df: pd.DataFrame, kind: str, params: dict) -> pd.DataFrame:
     """Compute one indicator. Returns a frame whose columns are the indicator's outputs."""
+    if kind in ict.CATALOG:
+        defaults, _, fn = ict.CATALOG[kind]
+        unknown = set(params) - set(defaults)
+        if unknown:
+            raise ValueError(f"{kind}: unknown parameter(s) {sorted(unknown)}; use {defaults}")
+        # Keep each parameter's type (k=3.0 from an LLM becomes 3).
+        p = {k: type(v)(params.get(k, v)) for k, v in defaults.items()}
+        return fn(df, **p)
     if kind not in CATALOG:
-        raise ValueError(f"unknown indicator '{kind}'. Known: {', '.join(CATALOG)}")
+        known = ", ".join([*CATALOG, *ict.CATALOG])
+        raise ValueError(f"unknown indicator '{kind}'. Known: {known}")
     p = {**CATALOG[kind][0], **params}
     close = df["close"]
     if kind in ("sma", "ema"):
@@ -102,7 +113,8 @@ def compute(df: pd.DataFrame, kind: str, params: dict) -> pd.DataFrame:
 
 def catalog_text() -> str:
     lines = []
-    for name, (defaults, outputs) in CATALOG.items():
+    entries = [*CATALOG.items(), *((n, (d, o)) for n, (d, o, _) in ict.CATALOG.items())]
+    for name, (defaults, outputs) in entries:
         outs = "value" if outputs == ["value"] else ", ".join(f"<id>.{o}" for o in outputs)
         lines.append(f"- {name} params={defaults} outputs: {outs}")
     return "\n".join(lines)
