@@ -44,9 +44,17 @@ FUNCS = {
     "max": (2, 2, "larger of two values"),
     "where": (3, 3, "where(cond, a, b): a when cond is true, else b"),
     "ny_minute": (0, 0, "minutes since midnight New York time (570 = 09:30)"),
+    "minute_of_hour": (0, 0, "minute within the hour, 0-59 (New York time)"),
+    "bars_today": (0, 0, "bars since the New York day started (0 = first bar of the day)"),
+    "session_high": (2, 2, "session_high(a, b): highest high today between New York minute a and b "
+                           "(e.g. 120, 300 = London 02:00-05:00); missing before the window opens"),
+    "session_low": (2, 2, "session_low(a, b): lowest low today between New York minute a and b"),
+    "value_at": (2, 2, "value_at(x, m): x on today's first bar at/after New York minute m "
+                       "(value_at(open, 0) = midnight open, value_at(open, 570) = 09:30 open)"),
     "day_of_week": (0, 0, "0 = Monday ... 6 = Sunday (New York time)"),
 }
 WINDOW_FUNCS = {"count", "sum", "mean", "highest", "lowest", "std"}
+CLOCK_ARGS = {"session_high": (0, 1), "session_low": (0, 1), "value_at": (1,)}
 INT_ARG = {"count": 1, "sum": 1, "mean": 1, "highest": 1, "lowest": 1, "std": 1, "prev": 1,
            "change": 1}
 
@@ -98,6 +106,15 @@ def parse(expr: str) -> ast.Expression:
                         and arg.value == 0):
                     raise FeatureError(f"{node.func.id}: the bar count must be a whole number "
                                        f"from 1 to {MAX_WINDOW}")
+        if isinstance(node, ast.Call) and node.func.id in CLOCK_ARGS:
+            for i in CLOCK_ARGS[node.func.id]:
+                arg = node.args[i]
+                if not (isinstance(arg, ast.Constant) and isinstance(arg.value, (int, float))
+                        and 0 <= arg.value <= 1440):
+                    raise FeatureError(f"{node.func.id}: clock times must be numbers of minutes "
+                                       "from 0 to 1440 (New York time)")
+            if node.func.id != "value_at" and not node.args[0].value < node.args[1].value:
+                raise FeatureError(f"{node.func.id}: the window must start before it ends")
     return tree
 
 
@@ -181,6 +198,29 @@ def evaluate(expr: str, cols: pd.DataFrame, tz: str = "UTC") -> pd.Series:
             return pd.Series(ny.hour * 60 + ny.minute, index=idx).astype(float)
         if fn == "day_of_week":
             return pd.Series(ny_index().weekday, index=idx).astype(float)
+        if fn == "minute_of_hour":
+            return pd.Series(ny_index().minute, index=idx).astype(float)
+        if fn in ("bars_today", "session_high", "session_low"):
+            ny = ny_index()
+            day = pd.Series(ny.normalize(), index=idx).values
+            if fn == "bars_today":
+                return pd.Series(1.0, index=idx).groupby(day).cumsum() - 1
+            a, b = node.args[0].value, node.args[1].value
+            minute = ny.hour * 60 + ny.minute
+            inside = pd.Series((minute >= a) & (minute < b), index=idx)
+            col = "high" if fn == "session_high" else "low"
+            if col not in cols.columns:
+                raise FeatureError(f"{fn} needs the {col} column")
+            vals = _f(cols[col]).where(inside)
+            run = vals.groupby(day).cummax() if fn == "session_high" else vals.groupby(day).cummin()
+            return run.groupby(day).ffill()
+        if fn == "value_at":
+            ny = ny_index()
+            day = pd.Series(ny.normalize(), index=idx).values
+            x = ev(node.args[0])
+            reached = pd.Series((ny.hour * 60 + ny.minute) >= node.args[1].value, index=idx)
+            first = reached & ~reached.groupby(day).shift(1, fill_value=False).astype(bool)
+            return x.where(first).groupby(day).ffill()
         x = ev(node.args[0])
         if fn in ("bars_since", "minutes_since"):
             hit = _bool(x).to_numpy()
@@ -286,6 +326,28 @@ class PineWriter:
             return self.tmp(f'hour(time, "{NY}") * 60 + minute(time, "{NY}")')
         if fn == "day_of_week":
             return self.tmp(f'(dayofweek(time, "{NY}") + 5) % 7')
+        if fn == "minute_of_hour":
+            return self.tmp(f'minute(time, "{NY}")')
+        if fn in ("bars_today", "session_high", "session_low", "value_at"):
+            day = self.tmp(f'dayofmonth(time, "{NY}")')
+            new = self.tmp(f"na({day}[1]) or {day} != {day}[1]")
+            mins = self.tmp(f'hour(time, "{NY}") * 60 + minute(time, "{NY}")')
+            v = f"{self.prefix}_s{self.n}"
+            if fn == "bars_today":
+                self.lines += [f"var float {v} = 0.0", f"{v} := {new} ? 0.0 : {v} + 1"]
+                return v
+            if fn == "value_at":
+                x = self.ev(node.args[0])
+                m = node.args[1].value
+                self.lines += [f"var float {v} = na", f"if {new}", f"    {v} := na",
+                               f"if na({v}) and {mins} >= {m}", f"    {v} := {x}"]
+                return v
+            a, b = node.args[0].value, node.args[1].value
+            col, pick = ("high", "math.max") if fn == "session_high" else ("low", "math.min")
+            self.lines += [f"var float {v} = na", f"if {new}", f"    {v} := na",
+                           f"if {mins} >= {a} and {mins} < {b}",
+                           f"    {v} := na({v}) ? {col} : {pick}({v}, {col})"]
+            return v
         x = self.ev(node.args[0])
         n = node.args[1].value if len(node.args) > 1 and fn in INT_ARG else 1
         if fn == "bars_since":

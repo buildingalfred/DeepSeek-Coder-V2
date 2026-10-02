@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from . import backtest, data, llm
-from .agents import ICT_MISSION, STYLES, TEAMS, leaderboard_text
+from .agents import ALGO_MISSION, ICT_MISSION, STYLES, TEAMS, leaderboard_text
 from .board import Board
 from .village import Village
 
@@ -61,6 +61,12 @@ def load(path):
 
 
 def cmd_run(a):
+    url = None
+    if a.watch:
+        from .live import serve
+        Board(a.db).close()  # make sure the database exists before the page asks for it
+        url = serve(a.db, a.port, open_browser=True, background=True)
+        print(f"Live village at {url}")
     markets, name = load_markets(a.data, a.tz, a.timeframe)
     try:
         brain = llm.make(a.llm)
@@ -71,7 +77,8 @@ def cmd_run(a):
     board = Board(a.db)
     try:
         quants = a.quants.split(",") if a.quants else TEAMS[a.team]
-        mission = a.mission if a.mission is not None else (ICT_MISSION if "ict" in a.team else "")
+        default_mission = {"ict": ICT_MISSION + " " + ALGO_MISSION, "mixed": ALGO_MISSION}
+        mission = a.mission if a.mission is not None else default_mission.get(a.team, "")
         kw = dict(llm=brain, quants=quants, fee_bps=a.fee_bps, train_frac=a.train, seed=a.seed,
                   tuner=not a.no_tuner, mission=mission)
         survivors, table = [], []
@@ -91,6 +98,19 @@ def cmd_run(a):
         village.run(a.rounds, a.papers, a.reports)
     finally:
         board.close()
+    if url:
+        print(f"\nDone. The live village stays open at {url} - press Ctrl+C to quit.")
+        try:
+            import time
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
+
+
+def cmd_watch(a):
+    from .live import serve
+    serve(a.db, a.port, open_browser=not a.no_browser)
 
 
 def cmd_backtest(a):
@@ -199,6 +219,9 @@ def main(argv=None):
     r.add_argument("--reports", default="reports")
     r.add_argument("--seed", type=int, default=None)
     r.add_argument("--no-tuner", action="store_true", help="leave out the tuner villager")
+    r.add_argument("--watch", action="store_true",
+                   help="open the live village in your browser while it works")
+    r.add_argument("--port", type=int, default=8765)
     r.add_argument("--scout", default=None,
                    help="start small: hunt on this much recent data first, e.g. 3M or 90D")
     r.add_argument("--expand", default="6M,1Y,3Y,all",
@@ -226,6 +249,12 @@ def main(argv=None):
     s.add_argument("--seed", type=int, default=None)
     s.add_argument("--freq", default="B", help="bar size: B (business days, default), 1h, 15min ...")
     s.set_defaults(fn=cmd_sample)
+
+    w = sub.add_parser("watch", help="open the live village (characters, whiteboard, leaderboard)")
+    w.add_argument("--db", default="village.db")
+    w.add_argument("--port", type=int, default=8765)
+    w.add_argument("--no-browser", action="store_true")
+    w.set_defaults(fn=cmd_watch)
 
     pn = sub.add_parser("pine", help="turn a strategy into a TradingView Pine Script")
     pn.add_argument("spec", nargs="?", default="reports/best_strategy.json",

@@ -200,6 +200,15 @@ TEAMS = {
     "ict": ["ict_liquidity", "ict_blocks", "ict_time"],
     "mixed": ["ict_liquidity", "ict_blocks", "ict_time", "trend", "reversion"],
 }
+ALGO_MISSION = (
+    "Treat price as the output of a delivery algorithm, and reverse-engineer its rules. Think "
+    "like someone decoding a machine, not like a textbook trader: standard indicator strategies "
+    "assume a normal, random market and are not what we are looking for. Hunt for rules about "
+    "TIME (session opens, the midnight open, macro windows like xx:50-xx:10, quarter-hour cycles, "
+    "minutes between events), NUMBERS (round levels, counts of swings or gaps, digital roots), "
+    "SEQUENCE (raid of liquidity -> shift -> gap -> delivery to the next pool) and SYMMETRY (equal "
+    "times or ranges). Every idea must be a precise, falsifiable rule; the vault decides what is "
+    "real. Write your 'aha' moments and hunches on the whiteboard so the others can build on them.")
 ICT_MISSION = ("Find out whether ICT's model of price delivery holds up: test liquidity sweeps, "
                "market structure shifts, fair value gaps, order blocks, premium/discount and "
                "kill zones, and above all how they connect into one sequence. Work as a team: "
@@ -263,22 +272,52 @@ class Quant(Agent):
         return random_spec(self.style, self.rng, self.name, intraday=self.intraday)
 
 
+# Nova's idea pool for the no-LLM village: (family, formula, op, thresholds). The formulas assume
+# price is delivered by an algorithm with rules about TIME, NUMBERS, SEQUENCE and SYMMETRY.
 INVENTED = [
-    # (feature formula, condition op, candidate thresholds) - imagination for the no-LLM village
-    ("digital_root(count({flag}, {n}))", "==", [1, 3, 5, 7, 9]),
-    ("bars_since({flag})", "<=", [2, 5, 10, 20]),
-    ("count({flag}, {n})", ">=", [1, 2, 3]),
-    ("day_count({flag})", "<=", [1, 2]),
-    ("mod(bars_since({flag}), 3)", "==", [0, 1, 2]),
-    ("change(close, {m}) / prev(close, {m}) * 100", ">", [0, 0.1, 0.25]),
-    ("(high - low) / mean(high - low, {n})", ">", [1.0, 1.5, 2.0]),
+    # counting and numerology
+    ("number", "digital_root(count({flag}, {n}))", "==", [1, 3, 5, 6, 7, 9]),
+    ("number", "count({flag}, {n}) % 3", "==", [0, 1, 2]),
+    ("number", "digital_root(round(close))", "==", [1, 3, 6, 9]),
+    ("number", "round(close) % {step}", "<=", [1, 2, 5]),
+    ("number", "{step} - round(close) % {step}", "<=", [1, 2, 5]),
+    ("number", "digital_root(bars_since({flag}))", "==", [3, 6, 9]),
+    ("number", "bars_since({flag}) % {fib}", "==", [0]),
+    # sequence and memory
+    ("sequence", "bars_since({flag})", "<=", [1, 2, 3, 5, 8]),
+    ("sequence", "bars_since({flag2}) - bars_since({flag})", ">", [0, 2, 5]),
+    ("sequence", "count({flag}, {n})", ">=", [2, 3]),
+    ("sequence", "where(bars_since({flag}) < bars_since({flag2}), 1, 0)", "==", [1]),
+    # symmetry: the time from A to B equals the time from B to now
+    ("symmetry", "abs(bars_since({flag2}) - 2 * bars_since({flag}))", "<=", [0, 1, 2]),
+    ("symmetry", "abs((high - low) - prev(high - low, {m}))", "<", [0.5, 1, 2]),
+    # range and ratio
+    ("range", "(high - low) / mean(high - low, {n})", ">", [1.5, 2.0, 3.0]),
+    ("range", "(close - lowest(low, {n})) / (highest(high, {n}) - lowest(low, {n}))", "<", [0.21, 0.38, 0.5]),
+    ("range", "(close - lowest(low, {n})) / (highest(high, {n}) - lowest(low, {n}))", ">", [0.5, 0.62, 0.79]),
 ]
 INVENTED_TIME = [
-    ("minutes_since({flag})", "<=", [15, 30, 60, 120]),
-    ("ny_minute()", ">=", [120, 420, 570, 600, 810]),
-    ("ny_minute()", "<=", [300, 600, 660, 900]),
-    ("day_of_week()", "<=", [1, 2, 3]),
+    # the clock: macros, quarter cycles, session opens and session ranges
+    ("time", "minute_of_hour() % 15", "<=", [0, 2, 5]),
+    ("time", "minute_of_hour() >= 50 or minute_of_hour() <= 10", "==", [1]),
+    ("time", "ny_minute() >= {macro_a} and ny_minute() < {macro_b}", "==", [1]),
+    ("time", "digital_root(minute_of_hour())", "==", [3, 6, 9]),
+    ("time", "digital_root(bars_today())", "==", [1, 3, 7, 9]),
+    ("time", "day_of_week()", "==", [0, 1, 2, 3, 4]),
+    ("time", "minutes_since({flag})", "<=", [15, 30, 45, 60, 90]),
+    ("open", "close > value_at(open, 0)", "==", [0, 1]),
+    ("open", "close > value_at(open, 510)", "==", [0, 1]),
+    ("open", "close > value_at(open, 570)", "==", [0, 1]),
+    ("open", "abs(close - value_at(open, 0)) / mean(high - low, 50)", ">", [1, 2, 3]),
+    ("session", "low < session_low(0, 300) and ny_minute() >= 420", "==", [1]),
+    ("session", "high > session_high(0, 300) and ny_minute() >= 420", "==", [1]),
+    ("session", "low < session_low(120, 300) and ny_minute() >= 570", "==", [1]),
+    ("session", "high > session_high(120, 300) and ny_minute() >= 570", "==", [1]),
+    ("session", "(close - session_low(0, 570)) / (session_high(0, 570) - session_low(0, 570))", "<", [0.21, 0.38, 0.5]),
+    ("session", "(close - session_low(0, 570)) / (session_high(0, 570) - session_low(0, 570))", ">", [0.5, 0.62, 0.79]),
+    ("power of 3", "ny_minute() >= 600 and close > value_at(open, 0) and low < session_low(0, 570)", "==", [1]),
 ]
+MACROS = [(470, 490), (530, 550), (590, 610), (650, 670), (710, 730), (790, 820), (915, 945)]
 FLAGS = [("sweep", ["bull", "bear"]), ("structure", ["bos_up", "bos_down", "mss_up", "mss_down"]),
          ("fvg", ["bull", "bear"]), ("displacement", ["up", "down"])]
 
@@ -288,8 +327,13 @@ class Inventor(Agent):
     whiteboard (with invented features). She also takes the leader and bolts on one invented
     filter, so every round at least one wild idea gets tested."""
     role = "inventor"
-    SYSTEM = ("You are Nova, the Inventor in a village of trading researchers. Your job is "
-              "imagination: invent new, specific, testable hypotheses about how price behaves, "
+    SYSTEM = ("You are Nova, the Inventor in a village of trading researchers. You believe price "
+              "is delivered by an algorithm and your job is imagination: invent new, specific, "
+              "testable hypotheses about the algorithm's rules - never textbook indicator ideas. "
+              "Examples of the spirit: 'the NY AM macro 09:50-10:10 delivers to the London high "
+              "when the midnight open was below it', 'after the 3rd structure break of the day "
+              "the next FVG holds', 'moves end when the minutes since the sweep has a digital root "
+              "of 9', 'equal time from raid to shift and shift to target'. Invent new ones about how price behaves, "
               "especially hidden structure in timing and counting (minutes between events, how "
               "many swings formed before a move, digital roots, which weekday or minute of the "
               "session, sequences of sweeps and shifts). Build on the whiteboard and the "
@@ -319,28 +363,89 @@ class Inventor(Agent):
         items = data.get("hypotheses", []) if isinstance(data, dict) else data
         return [str(h)[:400] for h in items if h][:3] if isinstance(items, list) else []
 
-    def graft(self, spec: dict) -> tuple[dict, str]:
-        """Copy a strategy and add one invented feature filter to its entry. Returns (spec, idea)."""
-        spec = copy.deepcopy(spec)
-        side = "entry_long" if spec.get("entry_long") else "entry_short"
-        pool = INVENTED + (INVENTED_TIME if self.intraday else [])
-        formula, op, values = self.rng.choice(pool)
+    def design(self, ctx: dict, hypothesis: str, base: dict | None) -> dict | None:
+        """Turn one hypothesis into a strategy (LLM only), optionally on top of a leader."""
+        base_txt = json.dumps(base) if base else "(none: design from scratch)"
+        reply = self.ask(self.SYSTEM + "\n\n" + SPEC_GUIDE + "\n\nReply with ONLY the JSON strategy.",
+                         f"Hypothesis to test: {hypothesis}\n\nMarket: {ctx['data_summary']}\n\n"
+                         f"You may build on this leading strategy:\n{base_txt}\n\nWrite the strategy "
+                         "that tests the hypothesis as directly as possible, with invented features "
+                         "where needed. Name it after the hypothesis.", json_mode=True)
+        if not reply:
+            return None
+        try:
+            return strat.parse(reply)
+        except strat.SpecError:
+            return None
+
+    def _flag(self, spec: dict) -> str:
+        """A random event flag (sweep, structure break, gap, displacement), adding its indicator."""
         kind, outs = self.rng.choice(FLAGS)
         inds = spec.setdefault("indicators", [])
         have = next((i["id"] for i in inds if i.get("type") == kind and set(i) <= {"id", "type", "k"}),
                     None)
-        if "{flag}" in formula and not have:
+        if not have:
             have = f"nv{len(inds)}"
             inds.append({"id": have, "type": kind})
-        flag = f"{have}.{self.rng.choice(outs)}" if have else "close"
-        expr = (formula.replace("mod(bars_since({flag}), 3)", "bars_since({flag}) % 3")
-                .format(flag=flag, n=self.rng.choice([10, 20, 50, 100]), m=self.rng.choice([3, 6, 12])))
+        return f"{have}.{self.rng.choice(outs)}"
+
+    def graft(self, spec: dict) -> tuple[dict, str]:
+        """Copy a strategy and add one invented feature filter to its entry. Returns (spec, idea)."""
+        spec = copy.deepcopy(spec)
+        side = "entry_long" if spec.get("entry_long") else "entry_short"
+        pool = INVENTED + (INVENTED_TIME * 2 if self.intraday else [])
+        family, formula, op, values = self.rng.choice(pool)
+        macro = self.rng.choice(MACROS)
+        fill = {"n": self.rng.choice([8, 13, 21, 34, 55]), "m": self.rng.choice([3, 5, 8, 13]),
+                "step": self.rng.choice([10, 25, 50, 100]), "fib": self.rng.choice([3, 5, 8, 13]),
+                "macro_a": macro[0], "macro_b": macro[1]}
+        if "{flag}" in formula:
+            fill["flag"] = self._flag(spec)
+        if "{flag2}" in formula:
+            fill["flag2"] = self._flag(spec)
+        expr = formula.format(**fill)
         fid = f"nova{len(spec.get('features') or [])}"
         spec.setdefault("features", []).append({"id": fid, "expr": expr})
         threshold = self.rng.choice(values)
         spec[side] = list(spec.get(side) or []) + [{"left": fid, "op": op, "right": threshold}]
         spec["name"] = f"{base_name(spec.get('name', 'leader'))} + {expr} {op} {threshold}"[:110]
-        return spec, f"What if '{expr} {op} {threshold}' filters the leader's entries?"
+        return spec, f"[{family}] What if '{expr} {op} {threshold}' is one of the algorithm's rules?"
+
+    def crossbreed(self, a: dict, b: dict) -> tuple[dict, str]:
+        """Child of two good setups: a's rules plus one of b's entry conditions (with everything
+        that condition needs from b, renamed so nothing clashes)."""
+        child = copy.deepcopy(a)
+        side = "entry_long" if a.get("entry_long") else "entry_short"
+        donor = b.get(side) or b.get("entry_long") or b.get("entry_short") or []
+        if not donor:
+            return self.graft(a)
+        ids = [i["id"] for i in b.get("indicators") or []] + [f["id"] for f in b.get("features") or []]
+        rename = {i: f"x{i}" for i in ids}
+
+        def ren(name):
+            if not isinstance(name, str):
+                return name
+            head, dot, tail = name.partition(".")
+            return rename.get(head, head) + dot + tail
+
+        def ren_expr(expr):
+            for old, new in sorted(rename.items(), key=lambda kv: -len(kv[0])):
+                expr = re.sub(rf"\b{re.escape(old)}\b(?!\s*\()", new, expr)
+            return expr
+
+        taken = {i["id"] for i in child.get("indicators") or []} | \
+            {f["id"] for f in child.get("features") or []}
+        if taken & set(rename.values()):
+            return self.graft(a)
+        child.setdefault("indicators", []).extend(dict(i, id=rename[i["id"]]) for i in b.get("indicators") or [])
+        child.setdefault("features", []).extend({"id": rename[f["id"]], "expr": ren_expr(f["expr"])}
+                                                for f in b.get("features") or [])
+        cond = copy.deepcopy(self.rng.choice(donor))
+        cond["left"], cond["right"] = ren(cond["left"]), ren(cond["right"])
+        child[side] = list(child.get(side) or []) + [cond]
+        child["name"] = f"{base_name(a.get('name', 'A'))} x {base_name(b.get('name', 'B'))}"[:110]
+        return child, (f"[crossbreed] Child of '{base_name(a.get('name', 'A'))}' and "
+                       f"'{base_name(b.get('name', 'B'))}': does {_cond_text(cond)} add to it?")
 
 
 class Analyst(Agent):

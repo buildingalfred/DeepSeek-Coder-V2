@@ -12,6 +12,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY, round INTEGER, author TEXT, kind TEXT, content TEXT, created REAL
 );
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY, created REAL, dataset TEXT, round INTEGER, agent TEXT, text TEXT
+);
 CREATE TABLE IF NOT EXISTS strategies (
     id INTEGER PRIMARY KEY, round INTEGER, author TEXT, name TEXT, spec TEXT,
     train TEXT, test TEXT, score REAL, error TEXT, dataset TEXT, created REAL
@@ -20,10 +23,19 @@ CREATE TABLE IF NOT EXISTS strategies (
 
 
 class Board:
-    def __init__(self, path: str | Path = "village.db"):
+    def __init__(self, path: str | Path = "village.db", readonly: bool = False):
         self.path = str(path)
-        self.db = sqlite3.connect(self.path)
+        if readonly:
+            self.db = sqlite3.connect(f"file:{Path(self.path).resolve().as_posix()}?mode=ro",
+                                      uri=True, check_same_thread=False, timeout=5)
+            self.db.row_factory = sqlite3.Row
+            return
+        self.db = sqlite3.connect(self.path, timeout=10)
         self.db.row_factory = sqlite3.Row
+        if self.path != ":memory:":
+            # Lets the live view read while the village writes.
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, much faster commits
         self.db.executescript(SCHEMA)
         # Columns added after the first release; older village.db files get them on open.
         for table, column in (("strategies", "markets"), ("notes", "dataset")):
@@ -58,6 +70,12 @@ class Board:
         row = self.db.execute("SELECT 1 FROM notes WHERE kind = 'source' AND content = ?",
                               (source,)).fetchone()
         return row is not None
+
+    # --- events: what each villager is doing (for the live view) ---------------------------
+    def event(self, dataset: str, round_: int, agent: str, text: str) -> None:
+        self.db.execute("INSERT INTO events (created, dataset, round, agent, text) VALUES (?,?,?,?,?)",
+                        (time.time(), dataset, round_, agent, text))
+        self.db.commit()
 
     # --- strategies ----------------------------------------------------------------------
     def add_strategy(self, round_, author, spec, train, test, score, error, dataset,

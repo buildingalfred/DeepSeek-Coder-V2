@@ -370,7 +370,9 @@ def test_pine_is_valid_syntax():
             "sum(close, 3) + mean(close, 3) - highest(high, 5) * lowest(low, 5) / std(close, 5)",
             "prev(close, 2) % 7 + change(close)", "digital_root(f2) + abs(-1) + round(1.5) + floor(2.2)",
             "min(open, close) - max(open, close)", "where(not sw.bull, 1, -1)",
-            "ny_minute() >= 570 and day_of_week() <= 4 or close != open"])],
+            "ny_minute() >= 570 and day_of_week() <= 4 or close != open",
+            "minute_of_hour() + bars_today() + session_high(120, 300) - session_low(0, 570)",
+            "value_at(open, 0) + value_at(close * 2, 570)"])],
         "entry_long": [{"left": "f9", "op": "==", "right": 1}], "exit_long": []}
     specs += [nova.graft(specs[0])[0], every_function]
     for spec in specs + [_all_indicator_spec()]:
@@ -531,3 +533,91 @@ def test_librarian_uses_pine_prompt_for_indicators(tmp_path):
     assert agents.Librarian("L", LLM()).study(tmp_path, board, 1) == 1
     assert "Pine Script source code" in seen[0]
     board.close()
+
+
+# ---- clock functions, crossbreeding, live view -----------------------------------------------
+
+def _hourly():
+    idx = pd.date_range("2024-01-02 05:00", periods=24, freq="1h")   # 00:00 New York time
+    base = np.arange(24) + 100.0
+    return pd.DataFrame({"open": base, "high": base + 1, "low": base - 1, "close": base + 0.5},
+                        index=idx)
+
+
+def test_clock_functions():
+    df = _hourly()
+    lon_hi = features.evaluate("session_high(120, 300)", df)
+    assert lon_hi.iloc[:2].isna().all()                    # before 02:00 New York: no value yet
+    assert lon_hi.iloc[2:5].tolist() == [103, 104, 105]    # running high inside the window
+    assert lon_hi.iloc[10] == 105                          # kept after the window closes
+    assert features.evaluate("session_low(120, 300)", df).iloc[6] == 101
+    assert set(features.evaluate("value_at(open, 0)", df)) == {100.0}      # midnight open
+    nine = features.evaluate("value_at(open, 570)", df)
+    assert nine.iloc[:10].isna().all() and nine.iloc[10] == 110            # first bar at/after 09:30
+    assert features.evaluate("bars_today()", df).tolist()[:4] == [0, 1, 2, 3]
+    with pytest.raises(features.FeatureError):
+        features.parse("session_high(300, 120)")
+
+
+def test_pine_translates_clock_functions():
+    spec = {"name": "clock", "indicators": [],
+            "features": [{"id": "a", "expr": "close > value_at(open, 0) and low < session_low(120, 300)"}],
+            "entry_long": [{"left": "a", "op": "==", "right": 1}], "exit_long": []}
+    src = pine.to_pine(spec)
+    assert 'hour(time, "America/New_York") * 60' in src and "math.min(" in src
+
+
+def test_crossbreed_combines_two_parents(intraday):
+    nova = agents.Inventor("n", rng=random.Random(2), intraday=True)
+    a = agents.random_spec("ict_liquidity", random.Random(1), intraday=True)
+    b = agents.random_spec("ict_blocks", random.Random(2), intraday=True)
+    child, idea = nova.crossbreed(a, b)
+    assert "crossbreed" in idea and " x " in child["name"]
+    assert any(i["id"].startswith("x") for i in child["indicators"])
+    strat.build_columns(intraday, child)
+
+
+def test_nova_designs_a_strategy_from_her_hypothesis(tmp_path, intraday):
+    class LLM:
+        name = "fake"
+
+        def chat(self, system, user, json_mode=False):
+            if "Hypothesis to test" in user:
+                return json.dumps({"name": "macro test", "indicators": [], "features": [
+                    {"id": "m", "expr": "ny_minute() >= 590 and ny_minute() < 610"}],
+                    "entry_long": [{"left": "m", "op": "==", "right": 1}],
+                    "exit_long": [{"left": "m", "op": "==", "right": 0}]})
+            if "hypotheses" in user:
+                return '{"hypotheses": ["the 09:50 macro delivers up"]}'
+            if "Librarian" in system or "Critic" in system or "Mayor" in system:
+                return "- ok"
+            return json.dumps(always_long())
+
+    board = Board(tmp_path / "v.db")
+    Village(intraday, "fx", board, llm=LLM(), seed=0, tuner=False, log=lambda *_: None).run(
+        rounds=1, report_dir=str(tmp_path / "r"))
+    names = [r["name"] for r in board.all_strategies("fx") if r["author"].startswith("Nova")]
+    assert "macro test" in names
+    assert any("Hypothesis" in n["content"] for n in board.notes("whiteboard", 50, "fx"))
+    board.close()
+
+
+def test_live_view_serves_the_village(tmp_path, intraday):
+    import urllib.request
+    from village import live
+    board = Board(tmp_path / "v.db")
+    Village(intraday, "s", board, llm=None, seed=0, log=lambda *_: None).run(
+        rounds=2, report_dir=str(tmp_path / "r"))
+    board.close()
+    st = live.state(str(tmp_path / "v.db"))
+    assert st["ready"] and st["round"] == 2 and st["tested"] > 0
+    names = {v["name"] for v in st["villagers"]}
+    assert {"Tom", "Rita", "Bo", "Tess", "Ada", "Nova"} <= names
+    assert any(v["text"] for v in st["villagers"])          # speech bubbles have something to say
+    assert st["whiteboard"] and st["leaders"]
+    assert not live.state(str(tmp_path / "none.db"))["ready"]
+    url = live.serve(str(tmp_path / "v.db"), port=8890, open_browser=False, background=True)
+    page = urllib.request.urlopen(url).read().decode()
+    assert "Agent Village" in page and "whiteboard" in page.lower()
+    data_ = json.loads(urllib.request.urlopen(url + "state").read())
+    assert data_["dataset"] == "s"

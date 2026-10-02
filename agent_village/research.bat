@@ -13,7 +13,7 @@ python -m pip install -q numba || echo numba not available for this Python, runn
 if exist videos\*.* (
   python -m pip install -q faster-whisper && python -m village transcribe videos --out papers\transcripts
 )
-python -m village run --data data --timeframe 15min --tz America/New_York --team mixed --scout 3M --expand 6M,1Y,3Y,10Y,all --rounds 20 %*
+python -m village run --watch --data data --timeframe 15min --tz America/New_York --team mixed --scout 3M --expand 6M,1Y,3Y,10Y,all --rounds 20 %*
 echo.
 echo Done. Open the newest .html file in "reports" and paste reports\best_strategy.pine into TradingView.
 pause

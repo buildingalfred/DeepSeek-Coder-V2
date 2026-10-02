@@ -28,6 +28,13 @@ zone your data's times are in: many futures exports use exchange time (`America/
 York time. When it's done, open the newest `.html` file in `reports/`, and paste
 `reports/best_strategy.pine` into TradingView.
 
+A browser window opens with **the live village**: every villager is a character in a little
+town (library, trading floor, workshop, inventor's lab, analyst, town hall). Speech bubbles show
+what each one just did, villagers walk to **the whiteboard** when they write on it, and the
+side panels show every whiteboard note, the leaderboard, the best score per round and what the
+library found. You can open it on its own any time with `python -m village watch` (it reads
+`village.db`, also while a run is going).
+
 What happens:
 
 1. **The Librarian reads everything** in `papers/`: PDFs, transcripts, and your Pine indicators
@@ -50,7 +57,7 @@ What happens:
 | **Tom** (trend), **Rita** (mean reversion), **Bo** (breakout) | Quants. Each round, each one proposes a strategy in their own style, building on the board's ideas, the leaderboard and the critic's notes. |
 | **The Backtester** | Not an AI. It runs every strategy on your data, with fees, and fills orders at the next bar's open so nobody can cheat by seeing the future. |
 | **Tess the Tuner** | Not an AI. Each round she tries a dozen small variations of a leading strategy's numbers and keeps one only if it is clearly better. |
-| **Nova the Inventor** | The imagination. She writes new hypotheses on the whiteboard and grafts invented features onto the leaders (e.g. "digital root of the number of structure breaks", "minutes since the last sweep", "second FVG of the day") so every round at least one new idea gets tested. |
+| **Nova the Inventor** | The imagination. She treats price as an algorithm and hunts its rules. With an AI she writes hypotheses on the whiteboard and turns the best one into a strategy herself. Every round she also tests two inventions: grafting an idea onto a leader, or crossbreeding two leaders into a child. Her idea families: **time** (macros like 09:50-10:10, quarter-hour cycles, minutes since an event), **opens** (midnight, 08:30, 09:30), **sessions** (raids of the London or pre-market high/low), **numbers** (round levels, digital roots, counts), **sequence**, **symmetry** (equal times) and **power of 3**. |
 | **Carl the Critic** | Reviews each round: too few trades, deep drawdowns, losing to buy & hold, overfitting. |
 | **Maya the Mayor** | Writes the final report and opens **the vault**. |
 
@@ -65,8 +72,10 @@ Everyone reads it every round, so the team builds on each other's findings. It i
 
 **Invented features:** agents can create their own measurements with small formulas, for
 example `digital_root(count(st.bos_up, 50))`, `minutes_since(sw.bull)`, `day_count(fvg.bull)`
-(how many FVGs so far today), `ny_minute()` (time of day), `bars_since(...)`, `prev(...)`,
-`change(...)`, rolling `mean/sum/highest/lowest/std`, `where(...)`, arithmetic and comparisons.
+(how many FVGs so far today), `ny_minute()` and `minute_of_hour()` (the clock),
+`value_at(open, 0)` (midnight open), `session_high(120, 300)` (London high), `bars_today()`,
+`bars_since(...)`, `prev(...)`, `change(...)`, rolling `mean/sum/highest/lowest/std`,
+`where(...)`, arithmetic and comparisons.
 Only these building blocks are allowed (no code), they only look backwards in time, and they are
 translated into the Pine Script too.
 
@@ -156,11 +165,12 @@ python -m village fetch EURUSD=X --period 10y        # download more data
 python -m village pine reports/best_strategy.json    # strategy -> TradingView Pine Script
 python -m village pine --id 42                       # or any strategy from the board
 python -m village transcribe videos                  # videos -> text for the Librarian
+python -m village watch                              # open the live village
 python -m village sample --out data/sample.csv        # write synthetic data
 python -m village run --help                          # every option
 ```
 
-Useful options for `run`: `--fee-bps 10` (fees per side; crypto and forex often cost more than
+Useful options for `run`: `--watch` (open the live village), `--fee-bps 10` (fees per side; crypto and forex often cost more than
 the default 5), `--quants trend,trend,reversion` (choose who lives in the village), and
 `--train 0.6` (seal a bigger vault), `--no-tuner` (leave Tess out).
 
@@ -181,6 +191,10 @@ python -m village run --team ict --data data/EURUSD_15m.csv --tz UTC --rounds 20
 | **Ian** the order-block hunter | order blocks in discount (longs) or premium (shorts), OTE retracements |
 | **Iris** the time hunter | kill zones (London, NY AM, silver bullet) and raids on the previous day's high/low |
 | **Ada** the Analyst | takes the leader apart one condition at a time and reports which pieces are ESSENTIAL, which add nothing and which HURT. If dropping a piece helps, she submits the simpler version herself. |
+
+With `--team ict` or `--team mixed` the whole team also gets the algorithm mission: treat price
+as the output of a delivery algorithm and reverse-engineer its rules (time, numbers, sequence,
+symmetry) instead of trading textbook indicators. Every rule still has to pass the vault.
 
 The whole team shares one mission and reads Ada's findings every round, so they converge on the
 pieces that carry the edge and drop the decoration. `--team mixed` adds the trend and reversion
@@ -260,6 +274,7 @@ village/
   features.py    the formula language for invented features (and its Pine translation)
   stages.py      scout-then-expand ladder
   pine.py        export to TradingView Pine Script
+  live.py        the live village web page (characters, whiteboard)
   fast.py        compiled hot loops (numba)
   pdfs.py        reading PDFs and notes
   board.py       shared memory (SQLite)

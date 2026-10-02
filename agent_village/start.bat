@@ -8,7 +8,7 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-python -m village run --rounds 5 %*
+python -m village run --watch --rounds 5 %*
 echo.
 echo Done. Open the newest .html file in the "reports" folder in your browser.
 pause

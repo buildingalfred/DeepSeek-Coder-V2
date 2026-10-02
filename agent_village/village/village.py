@@ -2,6 +2,7 @@
 
 import json
 import random
+import re
 import time
 from pathlib import Path
 
@@ -47,7 +48,9 @@ class Village:
         self.llm = llm
         self.fee_bps = fee_bps
         self.train_frac = train_frac
-        self.log = log
+        self.round = board.last_round()
+        self._print = log
+        log = self.log  # every villager reports through the village, so the live view sees it
         self.mission = mission
         rng = random.Random(seed)
         intraday = any(data.bar_size(df) not in ("1d", "1w", "unknown") for df in self.markets.values())
@@ -78,6 +81,13 @@ class Village:
         self.seen = {fingerprint(r["spec"]) for r in rows if r["spec"]}
         self.behaviours = {behaviour(r) for r in rows if r["train"] and r["test"]}
 
+    def log(self, text: str) -> None:
+        """Print a line, and record '[Name] did something' lines as events for the live view."""
+        self._print(text)
+        m = re.match(r"\s*\[([^\]]+)\]\s*(.*)", text, re.S)
+        if m:
+            self.board.event(self.dataset, self.round, m.group(1), m.group(2).strip()[:600])
+
     def evaluate(self, spec: dict) -> dict:
         return backtest.evaluate(self.markets, spec, self.fee_bps, self.train_frac, self.caches)
 
@@ -89,7 +99,9 @@ class Village:
         brain = self.llm.name if self.llm else "no LLM (heuristic villagers)"
         self.log(f"Village waking up. Brain: {brain}.\nData: {self.data_summary}")
         for r in range(start_round + 1, start_round + rounds + 1):
+            self.round = r
             self.log(f"\n=== Round {r} ===")
+            self.board.event(self.dataset, r, "village", f"Round {r} begins")
             if papers:
                 n = self.librarian.study(papers, self.board, r)
                 if n:
@@ -242,24 +254,38 @@ class Village:
         return text
 
     def _invent(self, round_: int) -> None:
-        """Nova writes hypotheses on the whiteboard and grafts one invented filter on a leader."""
+        """Nova writes hypotheses on the whiteboard and tests up to two inventions per round:
+        with an AI, her best hypothesis as a strategy; always, a graft or a crossbreed."""
         top = [r for r in self.board.leaderboard(self.dataset, 3) if r["score"] > -99]
-        for h in self.inventor.brainstorm(self._context(self.quants[0])):
+        ctx = self._context(self.quants[0])
+        hypotheses = self.inventor.brainstorm(ctx)
+        for h in hypotheses:
             self.write(round_, self.inventor.name, f"Hypothesis: {h}")
-        if not top:
-            return
-        tried = 0
-        for _ in range(6):
-            spec, idea = self.inventor.graft(self.inventor.rng.choice(top)["spec"])
+        candidates = []
+        if hypotheses:
+            spec = self.inventor.design(ctx, hypotheses[0], top[0]["spec"] if top else None)
+            if spec:
+                candidates.append((spec, f"Testing my hypothesis: {hypotheses[0][:160]}"))
+        rng = self.inventor.rng
+        for _ in range(6 if top else 0):
+            if len(top) >= 2 and rng.random() < 0.4:
+                a, b = rng.sample(top, 2)
+                candidates.append(self.inventor.crossbreed(a["spec"], b["spec"]))
+            else:
+                candidates.append(self.inventor.graft(rng.choice(top)["spec"]))
+        done = 0
+        for spec, idea in candidates:
             evaluation, error = self._try(spec)
             if error:
                 continue
-            tried += 1
-            sid = self._record(round_, self.inventor.name, spec, evaluation)
+            clean = {k: v for k, v in spec.items() if not k.startswith("_") and k != "whiteboard"}
+            sid = self._record(round_, self.inventor.name, clean, evaluation)
             t = evaluation["train"]
             self.write(round_, self.inventor.name,
                        f"{idea} Tested as #{sid}: robust {t['robust_sharpe']}, {t['trades']} trades.")
-            return
+            done += 1
+            if done == 2:
+                return
 
     def seed(self, specs: list[dict], author: str) -> int:
         """Bring strategies found elsewhere (e.g. a smaller window) onto this board."""
