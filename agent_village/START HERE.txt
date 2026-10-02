@@ -1,0 +1,33 @@
+AGENT VILLAGE - START HERE
+==========================
+
+1) INSTALL (once)
+   - Install Python 3.10 - 3.12 from https://www.python.org/downloads/
+     IMPORTANT: tick "Add Python to PATH" on the first install screen.
+   - Optional but recommended, a free local AI brain:
+     install Ollama from https://ollama.com, then open Command Prompt and run:
+         ollama pull qwen2.5:14b
+     (Without an AI the village still runs, using its built-in random search.)
+
+2) PUT IN YOUR FILES
+   data\     your NQ / ES / YM price files (.csv or .txt, 1-minute is fine)
+   papers\   PDFs, notes, your Pine Script indicators (.pine or .txt), subtitles
+   videos\   videos or audio files (they get turned into text automatically)
+
+3) SET YOUR TIME ZONE
+   Right-click research.bat -> Edit. Change --tz America/New_York to the time
+   zone your data files use (many futures exports use America/Chicago).
+   If you pulled a different AI model, add  --llm ollama:qwen2.5:14b  to that line.
+   Save and close.
+
+4) START
+   Double-click research.bat.
+   The live village opens in your browser. Leave the black window open while
+   it works (with an AI this can take hours - that is normal).
+
+5) RESULTS
+   reports\   open the newest .html file in your browser
+   reports\best_strategy.pine   paste into TradingView: Pine Editor -> Add to chart
+
+Something goes wrong? Copy the text from the black window and send it to Claude.
+Just want to try it first? Double-click start.bat (runs on built-in test data).
