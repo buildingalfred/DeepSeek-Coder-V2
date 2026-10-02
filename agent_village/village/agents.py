@@ -41,7 +41,9 @@ Signals are checked at each bar's close and filled at the next bar's open. Fees 
 def _fmt_metrics(m: dict) -> str:
     if not m:
         return "n/a"
-    return (f"sharpe {m['sharpe']}, return {m['total_return_pct']}%, maxDD {m['max_drawdown_pct']}%, "
+    robust = f"robust {m['robust_sharpe']} (good periods {m['positive_periods']}), " \
+        if "robust_sharpe" in m else ""
+    return (f"{robust}sharpe {m['sharpe']}, return {m['total_return_pct']}%, maxDD {m['max_drawdown_pct']}%, "
             f"trades {m['trades']}, win {m['win_rate_pct']}%, PF {m['profit_factor']}, "
             f"buy&hold {m['buy_hold_pct']}%")
 
@@ -157,7 +159,9 @@ class Quant(Agent):
         return (f"You are {self.name}, a quant in a village of trading researchers. You are a "
                 f"{STYLES[self.style]} You work with others: build on good ideas on the board, "
                 "learn from the critic, avoid repeating failures, and keep strategies simple "
-                "(few rules generalise better; 20+ trades are needed to trust a result).\n\n"
+                "(few rules generalise better; 20+ trades are needed to trust a result). The "
+                "leaderboard ranks by 'robust' Sharpe: the strategy must work in every slice of "
+                "history and every market, not just one lucky stretch.\n\n"
                 + SPEC_GUIDE + "\n\nReply with ONLY the JSON strategy object.")
 
     def propose(self, ctx: dict, error: str | None = None, previous: str | None = None) -> dict:
@@ -183,10 +187,36 @@ class Quant(Agent):
     def heuristic(self, best_specs: list[dict]) -> dict:
         if best_specs and self.rng.random() < 0.5:
             spec = mutate(self.rng.choice(best_specs[:3]), self.rng)
-            base = re.sub(r" \(tweaked by .*\)$", "", spec.get("name", "leader"))
-            spec["name"] = f"{base} (tweaked by {self.name.split()[0]})"
+            spec["name"] = f"{base_name(spec.get('name', 'leader'))} (tweaked by {self.name.split()[0]})"
             return spec
         return random_spec(self.style, self.rng, self.name)
+
+
+class Tuner(Agent):
+    """Fine-tunes a leading strategy by trying small variations of its numbers. No LLM needed."""
+    role = "tuner"
+
+    def __init__(self, name, llm=None, log=print, rng=None, tries: int = 12):
+        super().__init__(name, llm, log)
+        self.rng = rng or random.Random()
+        self.tries = tries
+
+    def tune(self, spec: dict, parent_score: float, evaluate):
+        """evaluate(spec) -> (evaluation, score) or None. Returns ((spec, evaluation) or None, tried)."""
+        best, best_score, tried = None, parent_score, 0
+        base = base_name(spec.get("name", "strategy"))
+        for _ in range(self.tries):
+            candidate = mutate(spec, self.rng)
+            candidate["name"] = f"{base} (tuned)"
+            got = evaluate(candidate)
+            if got is None:
+                continue
+            tried += 1
+            evaluation, score = got
+            # Demand a clear improvement: tiny gains from tuning are usually noise.
+            if score > best_score + 0.05:
+                best, best_score = (candidate, evaluation), score
+        return best, tried
 
 
 class Critic(Agent):
@@ -223,6 +253,9 @@ class Critic(Agent):
             elif m["total_return_pct"] < m["buy_hold_pct"]:
                 notes.append(f"- {r['author']}: lost to buy & hold ({m['total_return_pct']}% vs "
                              f"{m['buy_hold_pct']}%).")
+            elif m["sharpe"] > 0 and m.get("robust_sharpe", 0) < 0:
+                notes.append(f"- {r['author']}: profitable overall but only in "
+                             f"{m['positive_periods']} periods; looks like luck, not an edge.")
             elif m["sharpe"] > 1:
                 notes.append(f"- {r['author']}: promising (sharpe {m['sharpe']}); others try variations.")
         return "\n".join(notes) or "- Nothing stood out this round."
@@ -325,6 +358,16 @@ def mutate(spec: dict, rng: random.Random) -> dict:
     if spec.get("stop_loss_pct") and rng.random() < 0.5:
         spec["stop_loss_pct"] = round(spec["stop_loss_pct"] * rng.uniform(0.7, 1.3), 1)
     return spec
+
+
+_SUFFIX = re.compile(r"\s*\((tuned|tweaked by [^)]*)\)\s*$")
+
+
+def base_name(name: str) -> str:
+    """'EMA cross (tuned) (tweaked by Bo)' -> 'EMA cross'."""
+    while _SUFFIX.search(name):
+        name = _SUFFIX.sub("", name)
+    return name
 
 
 def compact(spec: dict) -> str:

@@ -4,5 +4,7 @@ pypdf>=4.0
 requests>=2.28
 # Only needed for --llm claude:
 anthropic>=1.0
+# Only needed for the fetch command:
+yfinance>=0.2
 # Only needed to run the tests:
 pytest>=7

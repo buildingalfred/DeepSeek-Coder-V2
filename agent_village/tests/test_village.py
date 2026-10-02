@@ -96,21 +96,25 @@ def test_load_csv_roundtrip(tmp_path, df):
 
 
 class FakeLLM:
-    """Scripted brain: first reply is broken, later replies are valid, to exercise the retry."""
+    """Scripted brain: one broken reply and one duplicate, to exercise the retries."""
     name = "fake"
 
     def __init__(self):
         self.calls = 0
+        self.prompts = []
 
     def chat(self, system, user, json_mode=False):
         self.calls += 1
+        self.prompts.append(user)
         if "Librarian" in system:
             return '{"ideas": ["buy when RSI(2) < 10, sell when > 70"]}'
         if "Critic" in system or "Mayor" in system:
             return "- keep it simple"
         if self.calls == 2:
             return "not json at all"
-        return json.dumps({"name": "rsi2", "indicators": [{"id": "r", "type": "rsi", "period": 2}],
+        # Call 4 repeats call 3's rules, which the village must reject as a duplicate.
+        period = 2 + (self.calls if self.calls != 4 else 3)
+        return json.dumps({"name": "rsi2", "indicators": [{"id": "r", "type": "rsi", "period": period}],
                            "entry_long": [{"left": "r", "op": "<", "right": 10}],
                            "exit_long": [{"left": "r", "op": ">", "right": 70}]})
 
@@ -120,20 +124,95 @@ def test_village_end_to_end_with_fake_llm(tmp_path, df):
     papers.mkdir()
     (papers / "notes.md").write_text("Short-term RSI mean reversion works on indices.")
     board = Board(tmp_path / "v.db")
-    v = Village(df, "sample", board, llm=FakeLLM(), seed=0, log=lambda *_: None)
+    llm = FakeLLM()
+    v = Village(df, "sample", board, llm=llm, seed=0, tuner=False, log=lambda *_: None)
     report = v.run(rounds=2, papers=str(papers), report_dir=str(tmp_path / "reports"))
     assert report.exists() and "rsi2" in report.read_text()
+    assert list((tmp_path / "reports").glob("*.html"))
     assert board.notes("idea")
-    assert len(board.leaderboard("sample")) >= 5
+    assert any("already tested" in p for p in llm.prompts)
+    rows = board.all_strategies("sample")
+    assert len(rows) == 6
+    assert len({json.dumps(r["spec"]["indicators"]) for r in rows}) == 6
     # A second run continues the round numbering instead of starting over.
     v.run(rounds=1, report_dir=str(tmp_path / "reports"))
     assert board.last_round() == 3
     board.close()
 
 
-def test_village_runs_without_llm(tmp_path, df):
+def test_village_runs_without_llm_on_two_markets(tmp_path, df):
+    markets = {"a.csv": df, "b.csv": data.sample(900, seed=11)}
     board = Board(tmp_path / "v.db")
-    Village(df, "sample", board, llm=None, seed=0, log=lambda *_: None).run(
-        rounds=2, report_dir=str(tmp_path / "reports"))
-    assert len(board.in_round("sample", 2)) == 3
+    Village(markets, "a.csv+b.csv", board, llm=None, seed=0, log=lambda *_: None).run(
+        rounds=3, report_dir=str(tmp_path / "reports"))
+    authors = [r["author"] for r in board.in_round("a.csv+b.csv", 3)]
+    assert sum("quant" in a for a in authors) == 3
+    best = board.leaderboard("a.csv+b.csv", 1)[0]
+    assert set(best["markets"]) == {"a.csv", "b.csv"}
+    # Tuner variations that were thrown away still count as tries.
+    assert board.trial_count("a.csv+b.csv") >= len(board.all_strategies("a.csv+b.csv"))
+    html = next((tmp_path / "reports").glob("*.html")).read_text()
+    assert "<svg" in html and "vault" in html
     board.close()
+
+
+def test_robust_sharpe_prefers_consistency():
+    steady = backtest.robust_sharpe([0.8, 0.9, 1.0])
+    lucky = backtest.robust_sharpe([3.0, -0.5, -0.4])
+    assert steady > lucky
+
+
+def test_evaluate_combines_markets(df):
+    other = data.sample(900, seed=11)
+    spec = agents.random_spec("trend", random.Random(2))
+    ev = backtest.evaluate({"a": df, "b": other}, spec)
+    a, b = backtest.run(df, spec), backtest.run(other, spec)
+    assert ev["train"]["trades"] == a.train["trades"] + b.train["trades"]
+    assert ev["train"]["max_drawdown_pct"] == min(a.train["max_drawdown_pct"],
+                                                  b.train["max_drawdown_pct"])
+    assert "robust_sharpe" in ev["train"]
+
+
+def test_tuner_only_keeps_clear_improvements():
+    tuner = agents.Tuner("t", rng=random.Random(0), tries=5)
+    spec = agents.random_spec("trend", random.Random(0))
+    best, tried = tuner.tune(spec, 1.0, lambda s: ({"train": {}}, 1.01))
+    assert best is None and tried == 5
+    best, _ = tuner.tune(spec, 1.0, lambda s: ({"train": {}}, 2.0))
+    assert best[0]["name"].endswith("(tuned)")
+
+
+def test_old_database_is_upgraded(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE notes (id INTEGER PRIMARY KEY, round INTEGER, author TEXT, kind TEXT,
+                            content TEXT, created REAL);
+        CREATE TABLE strategies (id INTEGER PRIMARY KEY, round INTEGER, author TEXT, name TEXT,
+            spec TEXT, train TEXT, test TEXT, score REAL, error TEXT, dataset TEXT, created REAL);
+        INSERT INTO strategies (round, author, name, spec, train, test, score, dataset)
+            VALUES (1, 'x', 'old', '{}', '{}', '{}', 0.5, 'sample');
+    """)
+    db.commit()
+    db.close()
+    board = Board(path)
+    assert board.leaderboard("sample")[0]["markets"] is None
+    board.post(2, "c", "critique", "hi", "sample")
+    assert board.notes("critique", 5, "sample")[0]["content"] == "hi"
+    board.close()
+
+
+def test_fetch_flattens_yahoo_columns(monkeypatch, df):
+    import sys
+    import types
+    raw = df.rename(columns=str.title)
+    raw.columns = pd.MultiIndex.from_product([raw.columns, ["SPY"]])
+    fake = types.SimpleNamespace(download=lambda *a, **k: raw)
+    monkeypatch.setitem(sys.modules, "yfinance", fake)
+    out = data.fetch("SPY")
+    assert list(out.columns) == strat.PRICE_COLUMNS and len(out) == len(df)
+    monkeypatch.setitem(sys.modules, "yfinance",
+                        types.SimpleNamespace(download=lambda *a, **k: pd.DataFrame()))
+    with pytest.raises(ValueError, match="no data"):
+        data.fetch("NOPE")

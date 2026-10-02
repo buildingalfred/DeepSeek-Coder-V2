@@ -1,20 +1,33 @@
-"""The village loop: read, propose, backtest, critique, repeat. Then open the vault."""
+"""The village loop: read, propose, backtest, critique, tune, repeat. Then open the vault."""
 
 import json
 import random
 import time
 from pathlib import Path
 
-from . import backtest, data
+from . import backtest, data, report
 from . import strategy as strat
-from .agents import Critic, Librarian, Mayor, Quant, compact, leaderboard_text
+from .agents import Critic, Librarian, Mayor, Quant, Tuner, compact, leaderboard_text
 from .board import Board
+
+MAX_ATTEMPTS_LLM = 3        # an LLM quant gets this many tries to produce a valid, new strategy
+MAX_ATTEMPTS_HEURISTIC = 8  # random villagers are cheap, let them retry more on duplicates
+
+
+def fingerprint(spec: dict) -> str:
+    """Identity of a strategy's rules, ignoring its name and description."""
+    core = {k: v for k, v in spec.items() if k not in ("name", "idea") and not k.startswith("_")}
+    for key in strat.RULE_KEYS:
+        core.setdefault(key, [])
+    core.setdefault("stop_loss_pct", None)
+    core.setdefault("take_profit_pct", None)
+    return json.dumps(core, sort_keys=True)
 
 
 class Village:
-    def __init__(self, df, dataset: str, board: Board, llm=None, quants=None, fee_bps=5.0,
-                 train_frac=0.7, seed=None, log=print):
-        self.df = df
+    def __init__(self, markets, dataset: str, board: Board, llm=None, quants=None, fee_bps=5.0,
+                 train_frac=0.7, seed=None, tuner=True, log=print):
+        self.markets = markets if isinstance(markets, dict) else {dataset: markets}
         self.dataset = dataset
         self.board = board
         self.llm = llm
@@ -25,18 +38,31 @@ class Village:
         self.librarian = Librarian("Lena the Librarian", llm, log)
         self.critic = Critic("Carl the Critic", llm, log)
         self.mayor = Mayor("Maya the Mayor", llm, log)
+        self.tuner = Tuner("Tess the Tuner", None, log, random.Random(rng.random())) if tuner else None
         styles = quants or ["trend", "reversion", "breakout"]
         names = {"trend": "Tom", "reversion": "Rita", "breakout": "Bo"}
-        self.quants = [Quant(f"{names.get(s, s.title())} the {s} quant", s, llm, log,
-                             random.Random(rng.random())) for s in styles]
+        self.quants = []
+        for i, s in enumerate(styles):
+            name = f"{names.get(s, s.title())} the {s} quant"
+            if styles[:i].count(s):
+                name += f" {styles[:i].count(s) + 1}"
+            self.quants.append(Quant(name, s, llm, log, random.Random(rng.random())))
         # Agents only ever see the train period; the rest stays sealed in the vault.
-        train_df = df.iloc[: int(len(df) * train_frac)]
-        self.data_summary = data.summary(train_df, f"{dataset} (train period only)")
+        self.data_summary = "\n".join(
+            data.summary(df.iloc[: int(len(df) * train_frac)], f"{name} (train period only)")
+            for name, df in self.markets.items())
+        self.seen = {fingerprint(r["spec"]) for r in board.all_strategies(dataset) if r["spec"]}
+
+    def evaluate(self, spec: dict) -> dict:
+        return backtest.evaluate(self.markets, spec, self.fee_bps, self.train_frac)
+
+    def score(self, evaluation: dict) -> float:
+        return backtest.score(evaluation, len(self.markets))
 
     def run(self, rounds: int = 5, papers: str | None = None, report_dir: str = "reports") -> Path:
         start_round = self.board.last_round()
         brain = self.llm.name if self.llm else "no LLM (heuristic villagers)"
-        self.log(f"Village waking up. Brain: {brain}. Data: {self.data_summary}")
+        self.log(f"Village waking up. Brain: {brain}.\nData: {self.data_summary}")
         for r in range(start_round + 1, start_round + rounds + 1):
             self.log(f"\n=== Round {r} ===")
             if papers:
@@ -45,9 +71,11 @@ class Village:
                     self.log(f"  [{self.librarian.name}] posted {n} new ideas")
             for quant in self.quants:
                 self._turn(quant, r)
+            if self.tuner:
+                self._tune(r)
             critique = self.critic.review(self.board.in_round(self.dataset, r),
                                           leaderboard_text(self.board.leaderboard(self.dataset, 5)))
-            self.board.post(r, self.critic.name, "critique", critique)
+            self.board.post(r, self.critic.name, "critique", critique, self.dataset)
             self.log(f"  [{self.critic.name}]\n" + _indent(critique))
         return self.report(report_dir)
 
@@ -57,7 +85,7 @@ class Village:
         for row in self.board.by_author(self.dataset, quant.name, 3):
             result = f"ERROR: {row['error']}" if row["error"] else str(row["train"])
             mine.append(f"- {compact(row['spec'])}\n  -> {result}")
-        critiques = self.board.notes("critique", 1)
+        critiques = self.board.notes("critique", 1, self.dataset)
         return {
             "data_summary": self.data_summary,
             "ideas": "\n".join(f"- {n['content']}" for n in self.board.notes("idea", 15)),
@@ -69,76 +97,112 @@ class Village:
 
     def _turn(self, quant: Quant, round_: int) -> None:
         ctx = self._context(quant)
-        spec = quant.propose(ctx)
-        result, error = self._try(spec)
-        if error and quant.llm is not None:
-            self.log(f"  [{quant.name}] spec rejected ({error[:100]}), retrying")
-            previous = spec.get("_raw") or json.dumps(spec)
-            spec = quant.propose(ctx, error=error, previous=previous[:4000])
-            result, error = self._try(spec)
+        attempts = MAX_ATTEMPTS_LLM if quant.llm is not None else MAX_ATTEMPTS_HEURISTIC
+        error = previous = None
+        for attempt in range(attempts):
+            spec = quant.propose(ctx, error=error, previous=previous)
+            previous = (spec.get("_raw") or json.dumps(spec))[:4000]
+            evaluation, error = self._try(spec)
+            if not error:
+                break
+            if attempt + 1 < attempts and quant.llm is not None:
+                self.log(f"  [{quant.name}] rejected ({error[:100]}), retrying")
         clean = {k: v for k, v in spec.items() if not k.startswith("_")}
         if error:
             self.board.add_strategy(round_, quant.name, clean, None, None, None, error, self.dataset)
-            self.log(f"  [{quant.name}] invalid strategy: {error[:160]}")
+            self.log(f"  [{quant.name}] gave up this round: {error[:160]}")
             return
-        score = backtest.score(result)
-        sid = self.board.add_strategy(round_, quant.name, clean, result.train, result.test, score,
-                                      None, self.dataset)
-        self.log(f"  [{quant.name}] #{sid} '{clean.get('name', 'unnamed')}': "
-                 f"sharpe {result.train['sharpe']}, return {result.train['total_return_pct']}%, "
-                 f"trades {result.train['trades']} (train)")
+        self._record(round_, quant.name, clean, evaluation)
 
     def _try(self, spec: dict):
         if "_parse_error" in spec:
             return None, spec["_parse_error"]
+        if fingerprint(spec) in self.seen:
+            return None, ("these exact rules were already tested; change the indicators, "
+                          "parameters or conditions to try something new")
         try:
-            return backtest.run(self.df, spec, self.fee_bps, self.train_frac), None
+            return self.evaluate(spec), None
         except strat.SpecError as e:
             return None, str(e)
 
+    def _record(self, round_: int, author: str, spec: dict, evaluation: dict) -> int:
+        score = self.score(evaluation)
+        sid = self.board.add_strategy(round_, author, spec, evaluation["train"], evaluation["test"],
+                                      score, None, self.dataset, evaluation["markets"])
+        self.seen.add(fingerprint(spec))
+        t = evaluation["train"]
+        self.log(f"  [{author}] #{sid} '{spec.get('name', 'unnamed')}': robust {t['robust_sharpe']}, "
+                 f"sharpe {t['sharpe']}, return {t['total_return_pct']}%, trades {t['trades']}, "
+                 f"good periods {t['positive_periods']} (train)")
+        return sid
+
+    def _tune(self, round_: int) -> None:
+        top = [r for r in self.board.leaderboard(self.dataset, 3) if r["score"] > -99]
+        if not top:
+            return
+        parent = top[(round_ - 1) % len(top)]
+        best, tried = self.tuner.tune(parent["spec"], parent["score"], self._tuner_eval)
+        # Discarded variations still count as tries (the kept one is counted as a strategy).
+        discarded = tried - (best is not None)
+        self.board.post(round_, self.tuner.name, "trials", str(discarded), self.dataset)
+        if best is None:
+            self.log(f"  [{self.tuner.name}] tried {tried} variations of #{parent['id']}, "
+                     "none beat it")
+            return
+        spec, evaluation = best
+        self._record(round_, self.tuner.name, spec, evaluation)
+
+    def _tuner_eval(self, spec: dict):
+        if fingerprint(spec) in self.seen:
+            return None
+        try:
+            evaluation = self.evaluate(spec)
+        except strat.SpecError:
+            return None
+        return evaluation, self.score(evaluation)
+
     def report(self, report_dir: str = "reports", top_n: int = 10) -> Path:
         rows = self.board.leaderboard(self.dataset, top_n)
-        lines = [f"# Village report: {self.dataset}", "",
-                 f"{time.strftime('%Y-%m-%d %H:%M')} · brain: "
-                 f"{self.llm.name if self.llm else 'none (heuristic)'} · fees {self.fee_bps} bps/side",
-                 "", "The villagers only saw the **train** period. The **test** (vault) period is "
-                 "later data nobody optimised on: it is the honest check.", "",
-                 "| # | Strategy | Author | Train Sharpe | Train return | Test Sharpe | Test return "
-                 "| Test trades | Test buy&hold | Verdict |",
-                 "|---|---|---|---|---|---|---|---|---|---|"]
-        table = []
-        for i, r in enumerate(rows, 1):
-            tr, te = r["train"], r["test"]
-            verdict = _verdict(tr, te)
-            lines.append(f"| {i} | {r['name']} | {r['author']} | {tr['sharpe']} | "
-                         f"{tr['total_return_pct']}% | {te['sharpe']} | {te['total_return_pct']}% | "
-                         f"{te['trades']} | {te['buy_hold_pct']}% | {verdict} |")
-            table.append(f"{i}. '{r['name']}' ({strat.describe(r['spec'])})\n"
-                         f"   train: {tr}\n   test: {te}\n   verdict: {verdict}")
-        if not rows:
-            lines.append("| - | no valid strategies yet | | | | | | | | |")
-        story = self.mayor.summarise("\n".join(table)) if rows else None
-        if story:
-            lines += ["", "## The Mayor's summary", "", story.strip()]
-        held = [r for r in rows if _verdict(r["train"], r["test"]) == "held up"]
+        trials = self.board.trial_count(self.dataset)
+        for r in rows:
+            r["verdict"] = verdict(r["train"], r["test"])
+        table = "\n".join(
+            f"{i}. '{r['name']}' ({strat.describe(r['spec'])})\n   train: {r['train']}\n"
+            f"   test: {r['test']}\n   verdict: {r['verdict']}" for i, r in enumerate(rows, 1))
+        story = self.mayor.summarise(table) if rows else None
+        held = [r for r in rows if r["verdict"] == "held up"]
         positive = [r for r in rows if r["train"]["sharpe"] > 0]
         best = held[0] if held else (positive[0] if positive else None)
-        if best:
-            lines += ["", f"## Best candidate: {best['name']}", "",
-                      "```json", json.dumps(best["spec"], indent=2), "```"]
-        lines += ["", "_Backtests are not promises. Paper-trade anything before risking money._"]
+        brain = self.llm.name if self.llm else "none (heuristic)"
 
         out = Path(report_dir)
         out.mkdir(parents=True, exist_ok=True)
-        path = out / f"report-{time.strftime('%Y%m%d-%H%M%S')}.md"
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        md = report.markdown(self.dataset, rows, best, story, trials, brain, self.fee_bps)
+        path = out / f"report-{stamp}.md"
+        path.write_text(md, encoding="utf-8")
+        charts = [(r, self._curves(r["spec"])) for r in (rows[:3] if rows else [])]
+        html_path = out / f"report-{stamp}.html"
+        html_path.write_text(report.html(self.dataset, rows, best, story, trials, brain,
+                                         self.fee_bps, charts, self.train_frac), encoding="utf-8")
         if best:
             (out / "best_strategy.json").write_text(json.dumps(best["spec"], indent=2), "utf-8")
-        self.log(f"\nReport written to {path}")
+        self.log(f"\nReport written to {html_path} (open it in a browser) and {path}")
         return path
 
+    def _curves(self, spec: dict) -> dict:
+        """Equity curve per market (plus buy & hold when there is a single market)."""
+        curves = {}
+        for name, df in self.markets.items():
+            res = backtest.run(df, spec, self.fee_bps, self.train_frac)
+            curves[name] = res.equity
+        if len(self.markets) == 1:
+            df = next(iter(self.markets.values()))
+            curves["buy & hold"] = df["close"] / df["close"].iloc[0]
+        return curves
 
-def _verdict(train: dict, test: dict) -> str:
+
+def verdict(train: dict, test: dict) -> str:
     if train["sharpe"] <= 0:
         return "never worked"
     if test["trades"] < 3:

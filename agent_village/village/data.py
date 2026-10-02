@@ -41,6 +41,23 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     return df
 
 
+def fetch(symbol: str, period: str = "max", interval: str = "1d") -> pd.DataFrame:
+    """Download OHLCV bars from Yahoo Finance. Intraday intervals only go back a limited time."""
+    import yfinance as yf  # optional dependency
+
+    raw = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
+    if raw is None or raw.empty:
+        raise ValueError(f"Yahoo Finance returned no data for '{symbol}' (period={period}, "
+                         f"interval={interval}). Check the symbol on finance.yahoo.com.")
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    raw.columns = [str(c).lower() for c in raw.columns]
+    df = raw[[c for c in PRICE_COLUMNS if c in raw.columns]].dropna(subset=["close"])
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df
+
+
 def sample(n: int = 3000, seed: int = 7) -> pd.DataFrame:
     """Synthetic daily prices with trending and choppy regimes. Good for testing, not for profit."""
     rng = np.random.default_rng(seed)

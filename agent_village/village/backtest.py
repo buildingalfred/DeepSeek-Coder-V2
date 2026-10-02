@@ -19,6 +19,9 @@ class Result:
     full: dict
     trades: list = field(default_factory=list)
     equity: pd.Series | None = None
+    returns: np.ndarray | None = None
+    split: int = 0
+    bars_per_year: float = 252.0
 
 
 def bars_per_year(index: pd.Index) -> float:
@@ -87,6 +90,9 @@ def run(df: pd.DataFrame, spec: dict, fee_bps: float = 5.0, train_frac: float = 
         full=metrics(rets, pos, buy_hold, trades, 0, n, bpy),
         trades=trades,
         equity=equity,
+        returns=rets,
+        split=split,
+        bars_per_year=bpy,
     )
 
 
@@ -119,9 +125,63 @@ def metrics(rets, pos, buy_hold, trades, lo, hi, bpy) -> dict:
     }
 
 
-def score(result: Result) -> float:
-    """Leaderboard score. Uses the TRAIN period only, so the test period stays an honest check."""
-    m = result.train
-    if not m or m["trades"] < 5:
+def chunk_sharpes(result: Result, chunks: int = 3) -> list[float]:
+    """Sharpe of each equal slice of the train period. A real edge should show up in most of them."""
+    train = result.returns[: result.split]
+    out = []
+    for piece in np.array_split(train, chunks):
+        std = piece.std()
+        out.append(float(piece.mean() / std * np.sqrt(result.bars_per_year)) if std > 0 else 0.0)
+    return out
+
+
+def evaluate(markets: dict, spec: dict, fee_bps: float = 5.0, train_frac: float = 0.7) -> dict:
+    """Backtest one spec on every market and combine the results.
+
+    Returns {"train": {...}, "test": {...}, "markets": {name: {"train", "test"}}}. The combined
+    train metrics include "robust_sharpe" (see robust_sharpe) which is what the leaderboard ranks.
+    """
+    results = {name: run(df, spec, fee_bps, train_frac) for name, df in markets.items()}
+    pieces = [s for r in results.values() for s in chunk_sharpes(r)]
+    train = combine([r.train for r in results.values()])
+    train["robust_sharpe"] = robust_sharpe(pieces)
+    train["positive_periods"] = f"{sum(s > 0 for s in pieces)}/{len(pieces)}"
+    return {
+        "train": train,
+        "test": combine([r.test for r in results.values()]),
+        "markets": {n: {"train": r.train, "test": r.test} for n, r in results.items()},
+    }
+
+
+def robust_sharpe(pieces: list[float]) -> float:
+    """Average Sharpe over slices of history, minus a penalty when they disagree.
+
+    A strategy that earns everything in one lucky stretch scores lower than one that works
+    a little in every stretch and every market.
+    """
+    arr = np.asarray(pieces, float)
+    return round(float(arr.mean() - 0.5 * arr.std()), 3)
+
+
+def combine(ms: list[dict]) -> dict:
+    """Average per-market metrics; trades are summed and the drawdown is the worst one."""
+    ms = [m for m in ms if m]
+    if not ms:
+        return {}
+    if len(ms) == 1:
+        return dict(ms[0])
+    out = {k: round(float(np.mean([m[k] for m in ms])), 3) for k in ms[0]}
+    out["trades"] = int(sum(m["trades"] for m in ms))
+    out["max_drawdown_pct"] = min(m["max_drawdown_pct"] for m in ms)
+    return out
+
+
+MIN_TRADES_PER_MARKET = 10
+
+
+def score(evaluation: dict, n_markets: int = 1) -> float:
+    """Leaderboard score from the TRAIN period only, so the test period stays an honest check."""
+    m = evaluation["train"]
+    if not m or m["trades"] < MIN_TRADES_PER_MARKET * n_markets:
         return -99.0
-    return m["sharpe"]
+    return m["robust_sharpe"]

@@ -11,6 +11,7 @@ round after round. It runs on your own computer.
 | **Lena the Librarian** | Reads every PDF, `.txt` and `.md` file in `papers/` and posts trading ideas to the board. |
 | **Tom** (trend), **Rita** (mean reversion), **Bo** (breakout) | Quants. Each round, each one proposes a strategy in their own style, building on the board's ideas, the leaderboard and the critic's notes. |
 | **The Backtester** | Not an AI. It runs every strategy on your data, with fees, and fills orders at the next bar's open so nobody can cheat by seeing the future. |
+| **Tess the Tuner** | Not an AI. Each round she tries a dozen small variations of a leading strategy's numbers and keeps one only if it is clearly better. |
 | **Carl the Critic** | Reviews each round: too few trades, deep drawdowns, losing to buy & hold, overfitting. |
 | **Maya the Mayor** | Writes the final report and opens **the vault**. |
 
@@ -18,6 +19,13 @@ round after round. It runs on your own computer.
 30% stays sealed. The final report shows how each strategy did on that unseen data. A strategy
 that only works on the train period was overfit, meaning it memorised noise. This is the honest
 check that tells you whether the village found something real.
+
+**The robust score:** the leaderboard does not just reward the most profit. It splits the train
+period into slices and ranks strategies by how well they did in *every* slice (and every market),
+minus a penalty when the slices disagree. A strategy that made all its money in one lucky year
+ranks below one that earned steadily. The village also refuses to test the exact same rules
+twice, and the report says how many strategies were tried in total. The more tries, the more
+likely the winner is just lucky.
 
 Everything the village learns is stored in `village.db`. Run it again and it continues where it
 stopped.
@@ -32,6 +40,9 @@ Open a terminal in this `agent_village` folder and run:
 ```
 pip install -r requirements.txt
 ```
+
+On Windows you can instead double-click **`start.bat`**. It installs everything and runs five
+rounds.
 
 ### Give the villagers a brain (pick one)
 
@@ -62,30 +73,40 @@ python -m village run --rounds 5
 
 With your own data and papers:
 
-1. Put a price CSV in `data/`. It needs a date/time column and `open, high, low, close`
-   (`volume` is optional). Exports from Yahoo Finance and TradingView usually
-   work as they are.
+1. Get price data. Download it from Yahoo Finance in one line:
+   ```
+   python -m village fetch SPY
+   python -m village fetch BTC-USD
+   ```
+   Or put your own CSV in `data/`. It needs a date/time column and `open, high, low, close`
+   (`volume` is optional). Exports from Yahoo Finance and TradingView usually work as they are.
 2. Put PDFs, books or notes in `papers/`.
 3. Run:
    ```
-   python -m village run --data data/BTCUSD.csv --rounds 10
+   python -m village run --data data/BTC-USD_1d.csv --rounds 10
    ```
 
-The report lands in `reports/`, and the best strategy that held up in the vault is saved to
-`reports/best_strategy.json`.
+**Test on several markets at once:** pass several files or a whole folder, for example
+`--data data/` or `--data data/SPY_1d.csv data/QQQ_1d.csv`. A strategy then has to work on all
+of them to rank well. This is the strongest protection against fooling yourself.
+
+The report lands in `reports/` in two versions. Open the `.html` one in your browser: it has the
+leaderboard, equity charts with the vault period shaded, and the Mayor's summary. The best
+strategy that held up in the vault is saved to `reports/best_strategy.json`.
 
 ### Other commands
 
 ```
-python -m village board --data data/BTCUSD.csv        # leaderboard + latest critique
-python -m village backtest my_strategy.json --data data/BTCUSD.csv
+python -m village board --data data/SPY_1d.csv        # leaderboard + latest critique
+python -m village backtest my_strategy.json --data data/SPY_1d.csv
+python -m village fetch EURUSD=X --period 10y        # download more data
 python -m village sample --out data/sample.csv        # write synthetic data
 python -m village run --help                          # every option
 ```
 
 Useful options for `run`: `--fee-bps 10` (fees per side; crypto and forex often cost more than
 the default 5), `--quants trend,trend,reversion` (choose who lives in the village), and
-`--train 0.6` (seal a bigger vault).
+`--train 0.6` (seal a bigger vault), `--no-tuner` (leave Tess out).
 
 ## How strategies look
 
@@ -116,7 +137,8 @@ They live in `village/indicators.py`. Add one to `CATALOG` there and the agents 
 ```
 village/
   agents.py      the villagers and their prompts
-  village.py     the round loop and the report
+  village.py     the round loop
+  report.py      the Markdown and HTML reports
   backtest.py    the backtester and its metrics
   strategy.py    the strategy JSON format and its validation
   indicators.py  technical indicators
