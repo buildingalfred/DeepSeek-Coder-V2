@@ -98,6 +98,7 @@ class Village:
         start_round = self.board.last_round()
         brain = self.llm.name if self.llm else "no LLM (heuristic villagers)"
         self.log(f"Village waking up. Brain: {brain}.\nData: {self.data_summary}")
+        self.board.event(self.dataset, self.round, "village", f"brain: {brain}")
         for r in range(start_round + 1, start_round + rounds + 1):
             self.round = r
             self.log(f"\n=== Round {r} ===")

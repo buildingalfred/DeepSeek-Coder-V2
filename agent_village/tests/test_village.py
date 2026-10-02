@@ -630,3 +630,13 @@ def test_auto_brain_uses_an_installed_ollama_model(monkeypatch):
     assert llm.make("auto").model == "qwen2.5:14b"
     monkeypatch.setattr(llm.OllamaLLM, "installed", staticmethod(lambda host=None: []))
     assert llm.make("auto") is None
+
+
+def test_day_first_dates_are_not_mistaken_for_month_first(tmp_path):
+    # The first ~1300 rows only have days 1-12, so they look month-first; row 1337 does not.
+    idx = pd.date_range("2008-12-11 18:00", periods=3000, freq="15min")
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+        pd.DataFrame({"Date": idx.strftime(fmt), "Open": 1.0, "High": 2.0, "Low": 0.5,
+                      "Close": 1.5}).to_csv(tmp_path / "x.csv", index=False)
+        x = data.load_csv(tmp_path / "x.csv")
+        assert x.index[0] == idx[0] and x.index[-1] == idx[-1] and len(x) == 3000, fmt

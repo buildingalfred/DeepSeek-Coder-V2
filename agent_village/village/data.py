@@ -18,7 +18,9 @@ _TIME_NAMES = ("datetime", "timestamp", "open_time", "date", "time", "index")
 _FORMATS = ["%Y%m%d %H%M%S", "%Y%m%d %H:%M:%S", "%Y%m%d %H%M", "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
             "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y.%m.%d %H:%M", "%Y.%m.%d %H:%M:%S",
-            "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d", "%m/%d/%Y", "%Y%m%d", "%d.%m.%Y"]
+            "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y%m%d",
+            "%d.%m.%Y", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M", "%m-%d-%Y %H:%M:%S", "%m-%d-%Y %H:%M",
+            "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"]
 DATA_SUFFIXES = (".csv", ".txt")
 
 
@@ -39,16 +41,28 @@ def _looks_like_date(text: str) -> bool:
 
 
 def _parse_times(raw: pd.Series) -> pd.Series:
-    """Parse date/time text quickly by finding one format that fits, then using it everywhere."""
+    """Parse date/time text by finding the ONE format that fits every row.
+
+    Day-first and month-first dates (14/12/2008 vs 12/14/2008) look the same until the day goes
+    above 12, so every candidate is checked against the whole column. If several formats fit,
+    the one that puts the bars in time order wins (bar data only moves forward)."""
     text = raw.astype(str).str.strip()
-    sample = text.iloc[: min(len(text), 500)]
+    # Quick screen on rows spread over the whole file, then confirm on all rows.
+    spread = text.iloc[np.unique(np.linspace(0, len(text) - 1, min(len(text), 4000)).astype(int))]
+    fits = []
     for fmt in _FORMATS:
-        try:
-            pd.to_datetime(sample, format=fmt)
-        except (ValueError, TypeError):
+        if pd.to_datetime(spread, format=fmt, errors="coerce").isna().any():
             continue
-        return pd.to_datetime(text, format=fmt)
-    return pd.to_datetime(text, format="mixed")
+        full = pd.to_datetime(text, format=fmt, errors="coerce")
+        if full.isna().any():
+            continue
+        fits.append((float((full.diff().dropna() > pd.Timedelta(0)).mean()), fmt, full))
+    if fits:
+        return max(fits, key=lambda f: f[0])[2]
+    try:
+        return pd.to_datetime(text, format="mixed")
+    except (ValueError, TypeError):
+        return pd.to_datetime(text, format="mixed", dayfirst=True)
 
 
 def _clock(raw: pd.Series) -> pd.Series:

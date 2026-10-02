@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Village</title>
+<style>
+:root {
+  --bg:#f5f4ef; --card:#ffffff; --ink:#1d1d1b; --ink2:#5b5a55; --muted:#8e8c84; --line:#e7e4db;
+  --soft:#f1efe8; --good:#22a06b; --goodbg:#e3f5ec; --idle:#b9b6ac; --shadow:0 1px 2px rgba(30,28,20,.05), 0 6px 18px rgba(30,28,20,.05);
+  --map:#f3f1ea; --grass:#e6ead9; --path:#d8d3c5;
+  font-size:clamp(13px, .42vw + 6px, 17px);
+}
+* { box-sizing:border-box; }
+html, body { height:100%; }
+body { margin:0; background:var(--bg); color:var(--ink); overflow:hidden;
+  font:1rem/1.45 "Segoe UI", system-ui, -apple-system, sans-serif; }
+.app { display:grid; height:100vh; gap:14px; padding:14px;
+  grid-template-columns: 13rem minmax(0,1fr) 25rem 23rem; grid-template-rows:minmax(0,1fr); }
+.card { background:var(--card); border:1px solid var(--line); border-radius:14px; box-shadow:var(--shadow);
+  display:flex; flex-direction:column; min-height:0; }
+.card h2 { margin:0; font-size:1.02rem; font-weight:650; display:flex; align-items:center; gap:8px; }
+.card .head { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:14px 16px 8px; }
+.card .body { padding:0 16px 14px; overflow:auto; min-height:0; flex:1; }
+.col { display:flex; flex-direction:column; gap:14px; min-height:0; min-width:0; }
+.muted { color:var(--muted); } .small { font-size:.86rem; }
+.flash { animation:flash 1.2s ease-out; }
+@keyframes flash { 0% { box-shadow:0 0 0 3px #f5c451; } 100% { box-shadow:var(--shadow); } }
+
+/* sidebar */
+.side { padding:18px 12px; gap:6px; }
+.logo { display:flex; align-items:center; gap:10px; padding:2px 8px 16px; }
+.logo b { font-size:1.6rem; font-weight:800; letter-spacing:-1px; font-style:italic; }
+.logo span { font-size:1.12rem; font-weight:650; }
+.nav button { display:flex; width:100%; align-items:center; gap:12px; padding:10px 12px; border:0; border-radius:10px;
+  background:none; color:var(--ink); font:inherit; cursor:pointer; text-align:left; }
+.nav button:hover { background:var(--soft); } .nav button.on { background:#efede6; font-weight:600; }
+.nav svg { width:20px; height:20px; flex:none; }
+.side .grow { flex:1; }
+.brain { border:1px solid var(--line); border-radius:12px; padding:10px 12px; display:flex; gap:10px; align-items:center; }
+.brain .t { font-weight:600; font-size:.92rem; } .brain .s { font-size:.8rem; color:var(--muted); overflow-wrap:anywhere; }
+.facts { padding:12px 8px 0; display:flex; flex-direction:column; gap:7px; font-size:.86rem; color:var(--ink2); }
+.facts div { display:flex; gap:8px; align-items:center; }
+.dot { width:8px; height:8px; border-radius:50%; background:var(--idle); flex:none; display:inline-block; }
+.dot.on { background:var(--good); }
+.lib { margin-top:10px; padding:10px 8px 0; border-top:1px solid var(--line); font-size:.8rem; color:var(--ink2);
+  max-height:22vh; overflow:auto; }
+.lib b { display:block; color:var(--ink); font-size:.86rem; margin-bottom:4px; }
+.lib div { padding:3px 0; }
+
+/* center */
+.top { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:4px 4px 0; }
+.top h1 { margin:0; font-size:1.9rem; letter-spacing:-.5px; }
+.top p { margin:2px 0 0; color:var(--ink2); }
+.pills { display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+.pill { display:inline-flex; align-items:center; gap:7px; padding:5px 12px; border-radius:99px; font-size:.86rem;
+  background:var(--soft); color:var(--ink2); white-space:nowrap; }
+.pill.live { background:var(--goodbg); color:#17734d; }
+select { font:inherit; font-size:.86rem; border:1px solid var(--line); background:var(--card); color:var(--ink);
+  border-radius:99px; padding:5px 10px; max-width:22rem; }
+.mapcard { flex:1; padding:0; overflow:hidden; position:relative; }
+.mapcard .head { position:absolute; left:0; right:0; top:0; z-index:4; pointer-events:none; }
+.mapcard .head > * { pointer-events:auto; }
+.label { font-size:.78rem; font-weight:650; letter-spacing:.8px; color:var(--ink2); text-transform:uppercase; }
+.mapwrap { flex:1; min-height:0; container-type:size; display:flex; align-items:center; justify-content:center; }
+.map { position:relative; width:min(100cqw, calc(100cqh * 16 / 9)); aspect-ratio:16 / 9; }
+.map svg.world { position:absolute; inset:0; width:100%; height:100%; overflow:visible; }
+.path { fill:none; stroke:var(--path); stroke-width:3; stroke-dasharray:2 9; stroke-linecap:round; }
+.flow { fill:none; stroke-width:4; stroke-dasharray:10 14; stroke-linecap:round; opacity:0; transition:opacity .4s;
+  animation:flow 1.1s linear infinite; }
+.flow.on { opacity:.9; }
+@keyframes flow { to { stroke-dashoffset:-24; } }
+.walker { transition:transform 1.5s ease-in-out; }
+.walker .body { transform-box:fill-box; transform-origin:50% 100%; }
+.walker.active .body { animation:hop .5s ease-in-out infinite alternate; }
+.walker.walking .body { animation:sway .28s ease-in-out infinite alternate; }
+@keyframes hop { from { transform:translateY(0) } to { transform:translateY(-7px) } }
+@keyframes sway { from { transform:rotate(-6deg) } to { transform:rotate(6deg) } }
+.house .badge { transition:transform .3s; transform-box:fill-box; transform-origin:50% 100%; }
+.house.active .badge { animation:badge 1s ease-in-out infinite alternate; }
+@keyframes badge { from { transform:translateY(0) } to { transform:translateY(-4px) } }
+.hname { font-weight:650; fill:var(--ink); font-size:15px; paint-order:stroke; stroke:var(--map); stroke-width:5px; stroke-linejoin:round; }
+.hstat { fill:var(--ink2); font-size:13px; paint-order:stroke; stroke:var(--map); stroke-width:4px; }
+td .cut { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; overflow-wrap:anywhere; }
+.bubble { position:absolute; transform:translate(-50%, -100%); width:min(19rem, 30%); background:#fff; color:var(--ink);
+  border:1px solid var(--line); border-radius:12px; padding:8px 10px; font-size:.86rem; line-height:1.35;
+  box-shadow:0 8px 24px rgba(30,28,20,.14); z-index:6; pointer-events:none; opacity:0; transition:opacity .3s; }
+.bubble.on { opacity:1; }
+.bubble::after { content:""; position:absolute; left:50%; top:100%; transform:translateX(-50%);
+  border:8px solid transparent; border-top-color:#fff; }
+.bubble b { display:block; font-size:.78rem; color:var(--muted); margin-bottom:2px; }
+.boardtext { position:absolute; z-index:3; overflow:hidden; font-family:"Segoe Print","Bradley Hand","Comic Sans MS",cursive;
+  color:#26365a; font-size:clamp(9px, .62cqw, 15px); line-height:1.3; }
+.boardtext div { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.boardtext .aha { color:#b4232a; font-weight:700; }
+.stats { position:absolute; left:16px; bottom:14px; z-index:4; display:flex; background:var(--card); border:1px solid var(--line);
+  border-radius:12px; box-shadow:var(--shadow); }
+.stats div { padding:8px 16px; border-left:1px solid var(--line); }
+.stats div:first-child { border-left:0; }
+.stats b { display:block; font-size:1.1rem; } .stats span { font-size:.78rem; color:var(--muted); }
+.spark { position:absolute; right:16px; bottom:14px; z-index:4; background:var(--card); border:1px solid var(--line);
+  border-radius:12px; box-shadow:var(--shadow); padding:6px 10px 2px; width:15rem; }
+.spark svg text { fill:var(--muted); font-size:10px; }
+
+/* whiteboard */
+.filters { display:flex; gap:6px; flex-wrap:wrap; padding:0 16px 8px; }
+.filters button { font:inherit; font-size:.8rem; border:1px solid var(--line); background:var(--card); color:var(--ink2);
+  border-radius:99px; padding:3px 10px; cursor:pointer; }
+.filters button.on { background:var(--ink); color:#fff; border-color:var(--ink); }
+.note { border:1px solid var(--line); border-left:4px solid var(--c, #ccc); border-radius:10px; padding:8px 10px;
+  margin-bottom:8px; background:var(--s, #fafaf7); font-size:.9rem; line-height:1.4; overflow-wrap:anywhere; }
+.note .who { display:flex; justify-content:space-between; gap:8px; font-size:.78rem; color:var(--ink2); margin-bottom:2px; }
+.note .tag { font-size:.7rem; font-weight:700; letter-spacing:.5px; padding:1px 7px; border-radius:99px; background:#fff;
+  border:1px solid var(--line); color:var(--ink2); }
+.note .tag.aha { color:#b4232a; border-color:#f2c4c6; } .note .tag.hyp { color:#2c7a3b; border-color:#c4e6cb; }
+.note .tag.dead { color:#77756d; } .note .tag.test { color:#2f6fbf; border-color:#cbdcf3; }
+.note.new { animation:pop .7s ease-out; }
+@keyframes pop { from { transform:scale(.94); opacity:.3; } to { transform:none; opacity:1; } }
+
+/* tasks, leaderboard, activity */
+.task { display:flex; gap:12px; padding:10px 0; border-bottom:1px solid var(--line); }
+.task:last-child { border-bottom:0; }
+.tile { width:2.6rem; height:2.6rem; border-radius:10px; display:flex; align-items:center; justify-content:center;
+  font-size:1.25rem; flex:none; }
+.task .main { min-width:0; flex:1; }
+.task .row { display:flex; justify-content:space-between; gap:8px; }
+.task .nm { font-weight:600; } .task .ago { font-size:.78rem; color:var(--muted); white-space:nowrap; }
+.task .txt { font-size:.84rem; color:var(--ink2); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+.task .st { font-size:.78rem; display:flex; align-items:center; gap:6px; margin-top:3px; color:var(--ink2); }
+.bar { height:5px; border-radius:99px; background:var(--soft); margin-top:5px; overflow:hidden; }
+.bar i { display:block; height:100%; border-radius:99px; transition:width .6s; }
+table { width:100%; border-collapse:collapse; font-size:.86rem; }
+td, th { padding:6px 4px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+th { color:var(--muted); font-weight:600; font-size:.78rem; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+tr:last-child td { border-bottom:0; }
+.feed div { display:flex; gap:10px; padding:7px 0; border-bottom:1px solid var(--line); font-size:.86rem; }
+.feed div:last-child { border-bottom:0; }
+.feed .dot { margin-top:.45em; } .feed .t { flex:1; min-width:0; color:var(--ink2); overflow-wrap:anywhere; }
+.feed .t b { color:var(--ink); font-weight:600; } .feed .ago { font-size:.78rem; color:var(--muted); white-space:nowrap; }
+.empty { color:var(--muted); font-size:.88rem; padding:8px 0; }
+
+/* smaller screens: the last column goes under the whiteboard, then everything stacks */
+@media (max-width: 1700px) {
+  .app { grid-template-columns: 12rem minmax(0,1fr) 24rem; grid-template-rows: minmax(0,1.1fr) minmax(0,1fr); }
+  .side { grid-row:1 / 3; } .center { grid-row:1 / 3; grid-column:2; }
+  .c3 { grid-row:1; grid-column:3; } .c4 { grid-row:2; grid-column:3; }
+}
+@media (max-width: 1100px) {
+  body { overflow:auto; }
+  .app { height:auto; grid-template-columns:minmax(0,1fr); grid-template-rows:none; }
+  .side { display:none; } .center, .c3, .c4 { grid-row:auto; grid-column:auto; }
+  .mapcard { min-height:60vh; } .card .body { max-height:60vh; }
+}
+</style></head>
+<body>
+<div class="app">
+  <nav class="card side">
+    <div class="logo"><b>AV</b><span>Agent Village</span></div>
+    <div class="nav">
+      <button class="on" data-go="mapCard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/></svg>Village</button>
+      <button data-go="boardCard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21l4-4 4 4M7 9h10M7 12h6"/></svg>Whiteboard</button>
+      <button data-go="tasksCard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 4.5a3.2 3.2 0 0 1 0 6.3M21 20c0-2.6-1.6-4.9-4-5.7"/></svg>Villagers</button>
+      <button data-go="leadersCard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0zM7 6H4v2a3 3 0 0 0 3 3M17 6h3v2a3 3 0 0 1-3 3"/></svg>Leaderboard</button>
+      <button data-go="feedCard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>Activity</button>
+    </div>
+    <div class="grow"></div>
+    <div class="brain"><span style="font-size:1.6rem">&#129504;</span><div><div class="t">Brain</div><div class="s" id="brain">–</div></div></div>
+    <div class="facts">
+      <div><span class="dot" id="liveDot"></span><span id="onlineTxt">–</span></div>
+      <div>&#128202; <span id="testedTxt">–</span></div>
+      <div>&#128260; <span id="roundTxt">–</span></div>
+    </div>
+    <div class="lib" id="lib"><b>From the library</b><div class="empty">Nothing read yet.</div></div>
+  </nav>
+
+  <div class="col center">
+    <div class="top">
+      <div><h1>Agent Village</h1><p>Your algorithm research team, working on <b id="dsName">–</b></p></div>
+      <div class="pills"><span class="pill" id="statusPill"><span class="dot"></span><span>connecting…</span></span>
+        <span class="pill" id="updated">–</span><select id="ds" title="Which board to watch"></select></div>
+    </div>
+    <div class="card mapcard" id="mapCard">
+      <div class="head"><span class="label">The village</span><span class="pill" id="roundPill">round –</span></div>
+      <div class="mapwrap"><div class="map" id="map">
+        <svg class="world" id="world" viewBox="0 0 1600 900" aria-label="The village map"></svg>
+        <div class="boardtext" id="boardtext"></div>
+        <div class="bubble" id="bubble"></div>
+      </div></div>
+      <div class="stats">
+        <div><b id="sV">–</b><span>Villagers</span></div><div><b id="sW">–</b><span>Working now</span></div>
+        <div><b id="sT">–</b><span>Strategies tested</span></div><div><b id="sB">–</b><span>Best robust score</span></div>
+      </div>
+      <div class="spark" id="spark"></div>
+    </div>
+  </div>
+
+  <div class="col c3">
+    <div class="card" id="boardCard" style="flex:1.6">
+      <div class="head"><h2>&#128221; The Whiteboard</h2><span class="muted small" id="boardCount"></span></div>
+      <div class="filters" id="filters">
+        <button class="on" data-f="all">All</button><button data-f="aha">AHA</button>
+        <button data-f="hyp">Hypotheses</button><button data-f="test">Tests</button><button data-f="dead">Dead ends</button>
+      </div>
+      <div class="body" id="notes"></div>
+    </div>
+  </div>
+
+  <div class="col c4">
+    <div class="card" id="tasksCard" style="flex:1.25"><div class="head"><h2>Current Tasks</h2><span class="muted small" id="tasksSub"></span></div><div class="body" id="tasks"></div></div>
+    <div class="card" id="leadersCard" style="flex:.9"><div class="head"><h2>Leaderboard</h2><span class="muted small">train period</span></div><div class="body" id="leaders"></div></div>
+    <div class="card" id="feedCard" style="flex:1"><div class="head"><h2>Recent Activity</h2></div><div class="body feed" id="feed"></div></div>
+  </div>
+</div>
+
+<script>
+const W = 1600, H = 900, PLAZA = [800, 470];
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const ago = t => { if (!t) return ""; const s = Math.max(0, Date.now()/1000 - t);
+  return s < 60 ? Math.round(s) + "s ago" : s < 3600 ? Math.round(s/60) + "m ago" : Math.round(s/3600) + "h ago"; };
+const svg = (tag, attrs, inner = "") => `<${tag} ${Object.entries(attrs).map(([k, v]) => `${k}="${v}"`).join(" ")}>${inner}</${tag}>`;
+let rosterKey = "", places = {}, filter = "all", lastNote = 0, firstLoad = true, chosen = "", byName = {};
+
+/* ---------- drawing ---------- */
+function shade(hex, f) {
+  const n = parseInt(hex.slice(1), 16), r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  const m = v => Math.max(0, Math.min(255, Math.round(f < 0 ? v * (1 + f) : v + (255 - v) * f)));
+  return "#" + ((1 << 24) + (m(r) << 16) + (m(g) << 8) + m(b)).toString(16).slice(1);
+}
+function quad(pts) { return pts.map(p => p.join(",")).join(" "); }
+function wallPt(a, b, u, lift) { return [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u - lift]; }
+
+function house(v) {
+  const c = v.color, soft = v.soft, dark = shade(c, -0.25);
+  const L = [-46, -2], F = [0, 21], R = [46, -2], h = 46;
+  const win = (a, b, u1, u2, y1, y2, fill) => svg("polygon", {points: quad([wallPt(a, b, u1, y1), wallPt(a, b, u2, y1), wallPt(a, b, u2, y2), wallPt(a, b, u1, y2)]), fill, stroke: dark, "stroke-width": 1});
+  return `
+  <ellipse cx="0" cy="44" rx="86" ry="20" fill="rgba(60,50,30,.10)"/>
+  ${svg("polygon", {points: quad([[-80,0],[0,40],[0,48],[-80,8]]), fill: "#d4d8c4"})}
+  ${svg("polygon", {points: quad([[0,40],[80,0],[80,8],[0,48]]), fill: "#c5caB3"})}
+  ${svg("polygon", {points: quad([[-80,0],[0,-40],[80,0],[0,40]]), fill: "#e7ebd9", stroke: "#d6dbc6", "stroke-width": 1})}
+  ${svg("polygon", {points: quad([[-30,26],[-6,14],[2,18],[-22,30]]), fill: "#efe9d8"})}
+  ${svg("polygon", {points: quad([L, F, [F[0], F[1]-h], [L[0], L[1]-h]]), fill: "#fbfaf6", stroke: "#e2ded2", "stroke-width": 1})}
+  ${svg("polygon", {points: quad([F, R, [R[0], R[1]-h], [F[0], F[1]-h]]), fill: "#e8e4d9", stroke: "#d8d3c6", "stroke-width": 1})}
+  ${win(L, F, .14, .42, 14, 31, soft)}${win(L, F, .58, .86, 14, 31, soft)}
+  ${win(F, R, .30, .56, 0, 30, dark)}${win(F, R, .70, .90, 15, 31, soft)}
+  ${svg("polygon", {points: quad([[-54,-50],[0,-23],[0,-16],[-54,-43]]), fill: dark})}
+  ${svg("polygon", {points: quad([[0,-23],[54,-50],[54,-43],[0,-16]]), fill: shade(c, -0.4)})}
+  ${svg("polygon", {points: quad([[-54,-50],[0,-77],[54,-50],[0,-23]]), fill: c})}
+  ${svg("polygon", {points: quad([[-40,-50],[0,-70],[40,-50],[0,-30]]), fill: shade(c, .18)})}
+  <g class="badge"><rect x="-24" y="-122" width="48" height="44" rx="11" fill="#fff" stroke="${c}" stroke-width="3"/>
+    <rect x="-24" y="-82" width="48" height="5" rx="2" fill="${soft}"/>
+    <text x="0" y="-91" text-anchor="middle" font-size="25">${v.icon}</text></g>
+  <circle cx="-66" cy="-10" r="10" fill="#9cc391"/><rect x="-67.5" y="-2" width="3" height="9" fill="#8a6a45"/>
+  <circle cx="64" cy="-2" r="8" fill="#a9cd9d"/><rect x="62.5" y="5" width="3" height="7" fill="#8a6a45"/>`;
+}
+
+function person(v) {
+  return `<g class="body"><ellipse cx="0" cy="0" rx="13" ry="3.5" fill="rgba(0,0,0,.16)"/>
+    <rect x="-7" y="-14" width="5" height="13" rx="2.5" fill="#44445a"/><rect x="2" y="-14" width="5" height="13" rx="2.5" fill="#44445a"/>
+    <rect x="-11" y="-34" width="22" height="23" rx="9" fill="${v.color}"/>
+    <circle cx="0" cy="-45" r="12" fill="#f2c9a0"/>
+    <path d="M-12 -46 Q-11 -59 0 -59 Q11 -59 12 -46 Q7 -52 0 -52 Q-7 -52 -12 -46Z" fill="${shade(v.color, -0.55)}"/>
+    <circle cx="-4.5" cy="-44" r="1.7" fill="#222"/><circle cx="4.5" cy="-44" r="1.7" fill="#222"/>
+    <path d="M-4 -39 Q0 -36 4 -39" stroke="#7a3d2a" stroke-width="1.5" fill="none" stroke-linecap="round"/></g>`;
+}
+
+function plaza() {
+  const [x, y] = PLAZA;
+  return `<g transform="translate(${x},${y})">
+    <ellipse cx="0" cy="70" rx="170" ry="36" fill="rgba(60,50,30,.09)"/>
+    ${svg("polygon", {points: quad([[-160,0],[0,80],[0,90],[-160,10]]), fill: "#d6d1c1"})}
+    ${svg("polygon", {points: quad([[0,80],[160,0],[160,10],[0,90]]), fill: "#c9c3b1"})}
+    ${svg("polygon", {points: quad([[-160,0],[0,-80],[160,0],[0,80]]), fill: "#efebe0", stroke: "#ddd7c7", "stroke-width": 1})}
+    ${svg("polygon", {points: quad([[-110,0],[0,-55],[110,0],[0,55]]), fill: "#e6e1d2"})}
+    <rect x="-130" y="-208" width="260" height="150" rx="10" fill="#7b6a55"/>
+    <rect x="-122" y="-200" width="244" height="134" rx="6" fill="#fdfdf9"/>
+    <rect x="-96" y="-58" width="9" height="62" fill="#7b6a55"/><rect x="87" y="-58" width="9" height="62" fill="#7b6a55"/>
+    <rect x="-40" y="-70" width="80" height="6" rx="3" fill="#c9bba4"/>
+    <text x="0" y="-218" text-anchor="middle" class="hname">The Whiteboard</text></g>`;
+}
+
+function layout(villagers) {
+  // Houses evenly spaced (by distance, not angle) on an ellipse around the whiteboard plaza,
+  // leaving the spot straight above the whiteboard free.
+  const n = villagers.length, rx = 680, ry = 318, cx = PLAZA[0], cy = PLAZA[1] + 10;
+  const steps = 720, pts = [], len = [0];
+  for (let i = 0; i <= steps; i++) {
+    const a = -Math.PI / 2 + 2 * Math.PI * i / steps;
+    pts.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+    if (i) len.push(len[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  }
+  const total = len[steps], out = {};
+  villagers.forEach((v, k) => {
+    const target = total * (k + 0.5) / n;
+    let i = 0; while (len[i] < target) i++;
+    out[v.name] = pts[i].map(Math.round);
+  });
+  return out;
+}
+
+function drawWorld(villagers) {
+  places = layout(villagers);
+  const order = villagers.slice().sort((a, b) => places[a.name][1] - places[b.name][1]);
+  let paths = "", flows = "", houses = "", people = "";
+  for (const v of villagers) {
+    const [x, y] = places[v.name], [px, py] = PLAZA;
+    const mx = (x + px) / 2 + (y - py) * .12, my = (y + py) / 2 - (x - px) * .05;
+    const d = `M${x},${y + 18} Q${mx},${my} ${px + (x - px) * .2},${py + 10 + (y - py) * .2}`;
+    paths += svg("path", {d, class: "path"});
+    flows += svg("path", {d, class: "flow", id: "flow-" + v.name, stroke: v.color});
+  }
+  for (const v of order) {
+    const [x, y] = places[v.name];
+    houses += `<g class="house" id="house-${v.name}" transform="translate(${x},${y})"><g transform="scale(.8)">${house(v)}</g>
+      <text x="0" y="62" text-anchor="middle" class="hname">${esc(v.name)} · ${esc(v.role)}</text>
+      <g transform="translate(0,82)"><circle cx="-34" cy="-5" r="5" id="sdot-${v.name}" fill="#b9b6ac"/>
+      <text x="-24" y="0" class="hstat" id="stat-${v.name}">Idle</text></g></g>`;
+    people += `<g class="walker" id="walker-${v.name}" style="transform:translate(${x + 30}px,${y + 26}px)">${person(v)}</g>`;
+  }
+  const deco = [[120,110],[260,830],[1480,120],[1530,800],[560,860],[1080,860],[90,480],[1520,470]]
+    .map(([x, y]) => `<g opacity=".8"><circle cx="${x}" cy="${y}" r="13" fill="#b9d3ad"/><rect x="${x-1.5}" y="${y+10}" width="3" height="10" fill="#9b8462"/></g>`).join("");
+  $("world").innerHTML = `<defs><pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.3" fill="#e2ded3"/></pattern></defs>
+    <rect width="${W}" height="${H}" fill="url(#dots)"/>${deco}${paths}${flows}${plaza()}${houses}${people}`;
+  const b = $("boardtext"); // the whiteboard's writing area, in % of the map
+  b.style.left = ((PLAZA[0] - 112) / W * 100) + "%"; b.style.top = ((PLAZA[1] - 192) / H * 100) + "%";
+  b.style.width = (224 / W * 100) + "%"; b.style.height = (118 / H * 100) + "%";
+}
+
+/* ---------- live updates ---------- */
+function kind(text) {
+  if (/^AHA/i.test(text)) return ["aha", "AHA"];
+  if (/^Hypothesis/i.test(text)) return ["hyp", "HYPOTHESIS"];
+  if (/^Dead end/i.test(text)) return ["dead", "DEAD END"];
+  if (/Tested as|Testing my/i.test(text)) return ["test", "TESTED"];
+  return ["", "NOTE"];
+}
+
+function walk(name) {
+  const w = $("walker-" + name), home = places[name];
+  if (!w || !home || w.dataset.busy) return;
+  w.dataset.busy = 1; w.classList.add("walking");
+  const tx = PLAZA[0] + (Math.random() * 160 - 80), ty = PLAZA[1] + 40 + Math.random() * 20;
+  w.style.transform = `translate(${tx}px,${ty}px)`;
+  setTimeout(() => w.classList.remove("walking"), 1500);
+  setTimeout(() => { w.classList.add("walking"); w.style.transform = `translate(${home[0] + 30}px,${home[1] + 26}px)`; }, 4300);
+  setTimeout(() => { w.classList.remove("walking"); delete w.dataset.busy; }, 5800);
+}
+
+function render(s) {
+  const villagers = s.villagers || [];
+  byName = Object.fromEntries(villagers.map(v => [v.name, v]));
+  const key = villagers.map(v => v.name).join(",");
+  if (key !== rosterKey) { rosterKey = key; drawWorld(villagers); }
+  if (!s.ready) { $("statusPill").innerHTML = `<span class="dot"></span><span>${esc(s.message)}</span>`; return; }
+
+  const now = s.now, working = villagers.filter(v => now - v.time < 15);
+  const live = now - s.last_event < 20;
+  $("statusPill").className = "pill" + (live ? " live" : "");
+  $("statusPill").innerHTML = `<span class="dot${live ? " on" : ""}"></span><span>${live ? "Village is working" : s.last_event ? "Resting · last activity " + ago(s.last_event) : "Idle"}</span>`;
+  $("updated").textContent = "Updated " + new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+  $("dsName").textContent = s.dataset || "–";
+  $("roundPill").textContent = "round " + (s.round || "–");
+  $("brain").textContent = s.brain || "–";
+  $("liveDot").className = "dot" + (live ? " on" : "");
+  $("onlineTxt").textContent = `${villagers.length} villagers · ${working.length} working`;
+  $("testedTxt").textContent = `${s.tested} strategies tested`;
+  $("roundTxt").textContent = `round ${s.round || "–"}`;
+  const best = s.progress.length ? s.progress[s.progress.length - 1].best_so_far : null;
+  $("sV").textContent = villagers.length; $("sW").textContent = working.length;
+  $("sT").textContent = s.tested; $("sB").textContent = best ?? "–";
+  const sel = $("ds"), opts = `<option value="">Follow the action</option>` + s.datasets.map(d => `<option${d === chosen ? " selected" : ""}>${esc(d)}</option>`).join("");
+  if (sel.dataset.v !== opts) { sel.innerHTML = opts; sel.dataset.v = opts; }
+
+  // houses, paths, walkers and the speaker's bubble
+  const speaker = working.slice().sort((a, b) => b.time - a.time)[0];
+  for (const v of villagers) {
+    const on = now - v.time < 15;
+    $("house-" + v.name)?.classList.toggle("active", on);
+    $("walker-" + v.name)?.classList.toggle("active", on);
+    $("flow-" + v.name)?.classList.toggle("on", on);
+    const st = $("stat-" + v.name), dot = $("sdot-" + v.name);
+    if (st) st.textContent = on ? "Working" : v.time ? "Idle · " + ago(v.time) : "Waiting";
+    if (dot) dot.setAttribute("fill", on ? "#22a06b" : "#b9b6ac");
+  }
+  const bub = $("bubble");
+  if (speaker && places[speaker.name]) {
+    const [x, y] = places[speaker.name];
+    bub.style.left = (x / W * 100) + "%"; bub.style.top = ((y - 104) / H * 100) + "%";
+    bub.innerHTML = `<b>${esc(speaker.full)} · ${ago(speaker.time)}</b>${esc(speaker.text.slice(0, 240))}`;
+    bub.classList.add("on");
+  } else bub.classList.remove("on");
+
+  // whiteboard
+  const notes = s.whiteboard.slice().reverse();
+  $("boardtext").innerHTML = notes.slice(0, 7).map(n => `<div class="${/^AHA/.test(n.text) ? "aha" : ""}">• ${esc(n.text)}</div>`).join("");
+  const shown = notes.filter(n => filter === "all" || kind(n.text)[0] === filter);
+  $("boardCount").textContent = `${notes.length} notes`;
+  $("notes").innerHTML = shown.length ? shown.map(n => {
+    const who = n.author.split(" ")[0], v = byName[who], [k, label] = kind(n.text);
+    return `<div class="note${n.time > lastNote && !firstLoad ? " new" : ""}" style="--c:${v ? v.color : "#bbb"};--s:${v ? v.soft + "55" : "#fafaf7"}">
+      <div class="who"><span><b>${esc(who)}</b> · round ${n.round} · ${ago(n.time)}</span><span class="tag ${k}">${label}</span></div>${esc(n.text)}</div>`;
+  }).join("") : `<div class="empty">Nothing here yet. The villagers write their findings and hunches here.</div>`;
+  if (!firstLoad) for (const n of s.whiteboard) if (n.time > lastNote) walk(n.author.split(" ")[0]);
+  if (s.whiteboard.length) lastNote = Math.max(lastNote, ...s.whiteboard.map(n => n.time));
+
+  // current tasks
+  const acted = villagers.filter(v => v.this_round).length;
+  $("tasksSub").textContent = `round ${s.round || "–"}: ${acted}/${villagers.length} done`;
+  $("tasks").innerHTML = villagers.slice().sort((a, b) => b.time - a.time).map(v => {
+    const on = now - v.time < 15;
+    return `<div class="task"><div class="tile" style="background:${v.soft}">${v.icon}</div><div class="main">
+      <div class="row"><span class="nm">${esc(v.name)} <span class="muted small">· ${esc(v.role)}</span></span><span class="ago">${ago(v.time)}</span></div>
+      <div class="txt">${esc(v.text || "Waiting for the first round…")}</div>
+      <div class="bar"><i style="width:${on ? 100 : v.this_round ? 100 : 8}%;background:${on ? v.color : v.this_round ? shade(v.color, .45) : "#ddd"}"></i></div>
+      <div class="st"><span class="dot${on ? " on" : ""}"></span>${on ? "Working" : v.this_round ? "Done this round" : "Waiting"}</div></div></div>`;
+  }).join("");
+
+  // leaderboard, activity, library, progress
+  $("leaders").innerHTML = s.leaders.length ? `<table><tr><th>#</th><th>Setup</th><th>By</th><th class="num">Robust</th><th class="num">t</th><th class="num">Trades</th></tr>` +
+    s.leaders.map((l, i) => `<tr><td>${i + 1}</td><td title="${esc(l.name)}"><span class="cut">${esc(l.name)}</span></td><td>${esc(l.author.split(" ")[0])}</td>
+      <td class="num">${l.robust ?? "–"}</td><td class="num">${l.t ?? "–"}</td><td class="num">${l.trades ?? "–"}</td></tr>`).join("") + `</table>`
+    : `<div class="empty">No strategies scored yet.</div>`;
+  $("feed").innerHTML = s.events.filter(e => e.agent !== "village" || !e.text.startsWith("brain")).slice(0, 40).map(e => {
+    const who = e.agent.split(" ")[0], v = byName[who];
+    return `<div><span class="dot" style="background:${v ? v.color : "#999"}"></span><span class="t"><b>${esc(who)}</b> ${esc(e.text.slice(0, 220))}</span><span class="ago">${ago(e.created)}</span></div>`;
+  }).join("") || `<div class="empty">Nothing yet.</div>`;
+  $("lib").innerHTML = `<b>From the library</b>` + (s.ideas.length ? s.ideas.slice().reverse().map(i => `<div>• ${esc(i.text)}</div>`).join("")
+    : `<div class="empty">Nothing read yet. Put PDFs, Pine scripts or transcripts in papers.</div>`);
+  $("spark").innerHTML = spark(s.progress);
+  firstLoad = false;
+}
+
+function spark(points) {
+  if (points.length < 2) return `<div class="small muted" style="padding:6px 2px 8px">Best score by round appears after two rounds.</div>`;
+  const w = 230, h = 64, L = 28, R = 6, T = 8, B = 14;
+  const ys = points.map(p => p.best_so_far), lo = Math.min(...ys), hi = Math.max(...ys), span = hi - lo || 1;
+  const X = i => L + i * (w - L - R) / (points.length - 1), Y = v => T + (hi - v) * (h - T - B) / span;
+  const pts = points.map((p, i) => `${X(i).toFixed(1)},${Y(p.best_so_far).toFixed(1)}`).join(" ");
+  return `<div class="small muted">Best score by round</div><svg viewBox="0 0 ${w} ${h}" width="100%" role="img" aria-label="Best robust score by round">
+    <polyline points="${pts}" fill="none" stroke="#22a06b" stroke-width="2" stroke-linejoin="round"/>
+    <circle cx="${X(points.length - 1)}" cy="${Y(ys[ys.length - 1])}" r="3.5" fill="#22a06b"/>
+    <text x="${L - 4}" y="${Y(hi) + 4}" text-anchor="end">${hi.toFixed(2)}</text>
+    <text x="${L - 4}" y="${Y(lo) + 4}" text-anchor="end">${lo.toFixed(2)}</text>
+    <text x="${L}" y="${h - 2}">r${points[0].round}</text><text x="${w - R}" y="${h - 2}" text-anchor="end">r${points[points.length - 1].round}</text></svg>`;
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/state" + (chosen ? "?ds=" + encodeURIComponent(chosen) : ""), {cache: "no-store"});
+    render(await r.json());
+  } catch (e) {
+    $("statusPill").className = "pill";
+    $("statusPill").innerHTML = `<span class="dot"></span><span>Live view stopped (start it again with: python -m village watch)</span>`;
+  }
+}
+$("ds").addEventListener("change", e => { chosen = e.target.value; firstLoad = true; tick(); });
+$("filters").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  filter = b.dataset.f; document.querySelectorAll("#filters button").forEach(x => x.classList.toggle("on", x === b)); tick();
+});
+document.querySelectorAll(".nav button").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll(".nav button").forEach(x => x.classList.toggle("on", x === b));
+  const el = $(b.dataset.go); if (!el) return;
+  el.scrollIntoView({behavior: "smooth", block: "nearest"}); el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
+}));
+tick(); setInterval(tick, 2000);
+</script>
+</body></html>
