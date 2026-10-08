@@ -1,6 +1,7 @@
 // © swing-sweep projection — v7.9  (clicked signal candle · 0.618 confirmation · 15m trigger → 1m entry · re-measure after a stop · alarm switch)
 //@version=6
 indicator("Judas Projection", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+plot(na, "keep-alive", display = display.none)   // guarantees the script always has an output
 
 // ══════════════════════════════════════════════════════════════════════════════
 // WHAT THIS DOES
